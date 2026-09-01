@@ -49,6 +49,11 @@ def main_test():
         source.mkdir()
         pd.DataFrame(station_rows).to_csv(source/"validation_station_metrics_all_epochs.csv",index=False,encoding="utf-8-sig")
         training_history.to_csv(source/"training_history.csv",index=False,encoding="utf-8-sig")
+        truth_rows=[]
+        for position,station in enumerate(val_idx):
+            for row in range(100+position):
+                truth_rows.append({"station_index":int(station),"timestamp":row,"y_true":float(position+row/100)})
+        pd.DataFrame(truth_rows).to_csv(source/"validation_predictions.csv",index=False,encoding="utf-8-sig")
         torch.save(checkpoint,source/"best_checkpoint.pt")
         os.environ["DL_TCN_ANALYSIS_DIR"]=str(source)
         os.environ["DL_TCN_ANALYSIS_OUTPUT"]=str(output)
@@ -63,6 +68,7 @@ def main_test():
             "station_similarity_heatmap.png","station_static_pca.png","epoch_selection_by_station.csv",
             "selected_epoch_station_performance.csv","epoch_selection_performance_summary.csv",
             "primary_performance_comparison.csv","nested_loso_inner_method_scores.csv",
+            "curve_nested_loso_inner_scores.csv","predicted_rmse_regret_curves.csv",
             "station_best_epoch_plateau_diagnostics.csv","similarity_epoch_gap_diagnostics.csv",
             "target_aware_epoch_conclusion.json",
         )
@@ -70,7 +76,7 @@ def main_test():
         if missing: raise RuntimeError(f"analysis outputs missing: {missing}")
         comparison=pd.read_csv(output/"epoch_selection_by_station.csv")
         performance=pd.read_csv(output/"epoch_selection_performance_summary.csv")
-        required_methods={"global_validation_rmse","macro_station_rmse","target_aware_static_similarity_loso","target_aware_nested_loso","station_oracle"}
+        required_methods={"global_validation_rmse","macro_station_rmse","target_aware_static_similarity_loso","target_aware_knn_nested_loso","target_aware_curve_nested_loso","station_oracle"}
         if len(comparison)!=12 or not required_methods.issubset(set(performance.method)):
             raise RuntimeError("analysis output rows/methods錯誤")
         print({"analysis_smoke":True,"stations":len(comparison),"epochs":len(epochs),"outputs":len(expected)})
