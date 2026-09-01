@@ -135,3 +135,17 @@ selector不再預測離散的`argmin(epoch)`，而是用72站OOF error curves直
 ```
 
 程式會先只用outer static鎖定權重並寫出`LOCKED_WEIGHTS_BEFORE_OUTER_TRUTH.json`，之後才建立outer test dataset和計分，避免用outer PM2.5選checkpoint。
+
+## 72站粗分early／middle／late
+
+`analyze_coarse_epoch_regime.py`讀取既有六折OOF epoch曲線，不重新訓練TCN。它將每站oracle epoch粗分為early（1–5）、middle（6–10）、late（11–15），使用原始49項static features分別訓練淺層CART與Extra Trees。
+
+OOF評估時每次完整排除被預測站的類別與epoch曲線：分類器只用其餘71站，選定區間內的實際epoch也只依其餘71站平均RMSE決定。Bootstrap只評估分類穩定性。這是72站development analysis，不等同完全獨立outer驗證。
+
+```python
+%env DL_TCN_CROSSFIT_ROOT=/content/crossfit_target_conditioned_snapshots
+%env DL_TCN_COARSE_BOOTSTRAPS=100
+!python analyze_coarse_epoch_regime.py
+```
+
+主要結果位於`coarse_epoch_regime_analysis/coarse_regime_performance_summary.csv`；另輸出逐站分類、混淆矩陣、選定epoch指標、特徵重要性與CART規則。
