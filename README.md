@@ -37,7 +37,22 @@
 !python train_formal.py
 ```
 
-目前正式config：learning rate `3e-4`、batch size `64`、max epochs `15`、patience `7`。CUDA可用時自動使用AMP。
+目前正式config：learning rate `3e-4`、max epochs `15`、patience `7`。Colab L4會自動使用batch size `512`、4個輕量index workers、BF16 AMP、TF32與fused AdamW；其他CUDA GPU會依VRAM保守選擇batch。這些調整不改資料、split、特徵、模型架構或loss。
+
+如L4仍發生OOM，不需改程式，可在正式訓練前覆寫：
+
+```python
+%env DL_TCN_BATCH_SIZE=256
+```
+
+其他常用訓練設定也可在啟動程式前覆寫：
+
+```python
+%env DL_TCN_LEARNING_RATE=3e-4
+%env DL_TCN_WEIGHT_DECAY=1e-4
+%env DL_TCN_MAX_EPOCHS=15
+%env DL_TCN_PATIENCE=7
+```
 
 ## 建議將輸出寫入Google Drive
 

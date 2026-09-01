@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import platform
 import random
 import time
@@ -13,7 +14,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from config import CFG
+from config import CFG, apply_runtime_profile
 from data_pipeline import (
     ColdStartStationDataset,
     ColdStartIndexDataset,
@@ -49,17 +50,17 @@ def resolve_target(static: pd.DataFrame, name: str) -> int:
     return int(hit[0])
 
 
-def make_loader(dataset, shuffle: bool) -> DataLoader:
+def make_loader(dataset, shuffle: bool, batch_size: int | None = None) -> DataLoader:
     kwargs={
         "dataset":dataset,
-        "batch_size":CFG.batch_size,
+        "batch_size":batch_size or CFG.batch_size,
         "shuffle":shuffle,
         "num_workers":CFG.formal_num_workers,
         "pin_memory":CFG.device.type=="cuda",
         "collate_fn":collate_variable_donors,
     }
     if CFG.formal_num_workers>0:
-        kwargs.update(persistent_workers=True,prefetch_factor=2)
+        kwargs.update(persistent_workers=True,prefetch_factor=CFG.prefetch_factor)
     return DataLoader(**kwargs)
 
 
@@ -76,8 +77,14 @@ def collate_indices(batch):
 
 
 def make_index_loader(source_dataset,shuffle):
-    return DataLoader(ColdStartIndexDataset(source_dataset),batch_size=CFG.batch_size,shuffle=shuffle,
-                      num_workers=0,pin_memory=True,collate_fn=collate_indices)
+    kwargs={
+        "dataset":ColdStartIndexDataset(source_dataset),"batch_size":CFG.batch_size,
+        "shuffle":shuffle,"num_workers":CFG.formal_num_workers,
+        "pin_memory":True,"collate_fn":collate_indices,
+    }
+    if CFG.formal_num_workers>0:
+        kwargs.update(persistent_workers=True,prefetch_factor=CFG.prefetch_factor)
+    return DataLoader(**kwargs)
 
 
 class DeviceFeatureBuilder:
@@ -165,6 +172,24 @@ def make_grad_scaler(enabled: bool):
         return torch.cuda.amp.GradScaler(enabled=enabled,init_scale=CFG.amp_init_scale,growth_interval=CFG.amp_growth_interval)
 
 
+def amp_dtype_for(device: torch.device):
+    if device.type!="cuda" or not CFG.use_amp:
+        return None
+    if CFG.prefer_bf16 and torch.cuda.get_device_capability(0)[0]>=8 and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def make_optimizer(model,device):
+    kwargs={"lr":CFG.learning_rate,"weight_decay":CFG.weight_decay}
+    if device.type=="cuda":
+        try:
+            return torch.optim.AdamW(model.parameters(),fused=True,**kwargs),True
+        except (TypeError,RuntimeError):
+            pass
+    return torch.optim.AdamW(model.parameters(),**kwargs),False
+
+
 def regression_metrics(y_true: np.ndarray,y_pred: np.ndarray) -> dict[str,float]:
     y_true=np.asarray(y_true,dtype="float64"); y_pred=np.asarray(y_pred,dtype="float64")
     err=y_pred-y_true
@@ -177,7 +202,7 @@ def regression_metrics(y_true: np.ndarray,y_pred: np.ndarray) -> dict[str,float]
 
 
 def train_epoch(model,loader,optimizer,grad_scaler,device,epoch: int,feature_builder=None) -> float:
-    model.train(); amp_enabled=CFG.use_amp and device.type=="cuda"
+    model.train(); amp_dtype=amp_dtype_for(device); amp_enabled=amp_dtype is not None
     loss_sum=0.0; sample_count=0; started=time.perf_counter()
     for batch_number,batch in enumerate(loader,start=1):
         batch=feature_builder(batch) if feature_builder is not None else move_batch(batch,device)
@@ -185,7 +210,7 @@ def train_epoch(model,loader,optimizer,grad_scaler,device,epoch: int,feature_bui
             if batch["values"].device.type!="cuda" or next(model.parameters()).device.type!="cuda":
                 raise RuntimeError("CUDA available但model或batch沒有移到GPU")
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type,enabled=amp_enabled):
+        with torch.autocast(device_type=device.type,dtype=amp_dtype,enabled=amp_enabled):
             pred,_=model(
                 batch["values"],batch["mask"],batch["donor_static"],batch["geometry"],
                 batch["donor_padding_mask"],batch["target_static"],batch["time_features"],
@@ -211,11 +236,11 @@ def train_epoch(model,loader,optimizer,grad_scaler,device,epoch: int,feature_bui
 
 @torch.no_grad()
 def validate_epoch(model,loader,device,static,timestamps,epoch: int,feature_builder=None):
-    model.eval(); amp_enabled=CFG.use_amp and device.type=="cuda"
+    model.eval(); amp_dtype=amp_dtype_for(device); amp_enabled=amp_dtype is not None
     truths=[]; predictions=[]; station_indices=[]; time_indices=[]; seen=0; started=time.perf_counter()
     for batch_number,batch in enumerate(loader,start=1):
         batch=feature_builder(batch) if feature_builder is not None else move_batch(batch,device)
-        with torch.autocast(device_type=device.type,enabled=amp_enabled):
+        with torch.autocast(device_type=device.type,dtype=amp_dtype,enabled=amp_enabled):
             pred,_=model(
                 batch["values"],batch["mask"],batch["donor_static"],batch["geometry"],
                 batch["donor_padding_mask"],batch["target_static"],batch["time_features"],
@@ -266,6 +291,14 @@ def serializable_config() -> dict:
 def main() -> None:
     seed_all(CFG.seed)
     device=CFG.device
+    runtime_profile=apply_runtime_profile(CFG)
+    torch.set_num_threads(min(os.cpu_count() or 1,12))
+    if device.type=="cuda":
+        if CFG.enable_tf32:
+            torch.backends.cuda.matmul.allow_tf32=True
+            torch.backends.cudnn.allow_tf32=True
+            torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark=True
     output_dir=CFG.formal_output_root/CFG.formal_output_dirname
     output_dir.mkdir(parents=True,exist_ok=True)
     if not CFG.aq_data_dir.is_dir(): raise FileNotFoundError(f"AQ資料夾不存在: {CFG.aq_data_dir}")
@@ -289,14 +322,15 @@ def main() -> None:
     print(f"torch version: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
     print(f"GPU name: {gpu_name}")
+    print(f"runtime profile: {json.dumps(runtime_profile,ensure_ascii=False)}")
     print(f"train sample count: {len(train_ds):,}")
     print(f"validation sample count: {len(val_ds):,}")
     print(f"model parameters: {parameter_count:,}")
-    print(f"device: {device} | batch size: {CFG.batch_size} | max epochs: {CFG.max_epochs} | patience: {CFG.early_stopping_patience}",flush=True)
+    print(f"device: {device} | batch size: {CFG.batch_size} | workers: {CFG.formal_num_workers} | max epochs: {CFG.max_epochs} | patience: {CFG.early_stopping_patience}",flush=True)
 
     # Mandatory pre-training gate; it does not construct/read an outer dataset.
     sanity={"train":audit_dataset(train_ds),"validation":audit_dataset(val_ds)}
-    smoke=smoke_forward(model,make_loader(train_ds,False),device)
+    smoke=smoke_forward(model,make_loader(train_ds,False,CFG.smoke_batch_size),device)
     model.zero_grad(set_to_none=True)
     if sanity["train"]["sampled_donor_counts"]!=[59] or sanity["validation"]["sampled_donor_counts"]!=[60]:
         raise RuntimeError("sanity donor count未通過")
@@ -311,8 +345,10 @@ def main() -> None:
     else:
         train_loader=make_vectorized_loader(train_ds,train_idx,cube,timestamps,static,static_scaled,distance,scaler,True)
         val_loader=make_vectorized_loader(val_ds,train_idx,cube,timestamps,static,static_scaled,distance,scaler,False)
-    optimizer=torch.optim.AdamW(model.parameters(),lr=CFG.learning_rate,weight_decay=CFG.weight_decay)
-    grad_scaler=make_grad_scaler(CFG.use_amp and device.type=="cuda")
+    optimizer,fused_optimizer=make_optimizer(model,device)
+    amp_dtype=amp_dtype_for(device)
+    grad_scaler=make_grad_scaler(amp_dtype==torch.float16)
+    print(f"AMP dtype: {str(amp_dtype).replace('torch.','') if amp_dtype else 'disabled'} | fused AdamW: {fused_optimizer} | TF32: {CFG.enable_tf32 and device.type=='cuda'}",flush=True)
     best_macro=math.inf; best_epoch=0; best_metrics=None; epochs_without_improvement=0
     history=[]; total_start=time.perf_counter(); overall_peak_vram=0.0
     checkpoint_path=output_dir/"best_checkpoint.pt"
@@ -366,6 +402,7 @@ def main() -> None:
         "best_validation_bias":best_metrics["bias"],"training_time_seconds":total_seconds,
         "peak_vram_mb":overall_peak_vram,"checkpoint":str(checkpoint_path),
         "epochs_completed":len(history),"device":str(device),"gpu_name":gpu_name,
+        "runtime_profile":runtime_profile,"fused_adamw":fused_optimizer,
     }
     (output_dir/"training_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
     print(json.dumps(summary,ensure_ascii=False,indent=2),flush=True)
