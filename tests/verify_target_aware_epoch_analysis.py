@@ -62,15 +62,16 @@ def main_test():
             "station_epoch_matrix.csv","station_similarity_matrix.csv","station_similarity_long.csv",
             "station_similarity_heatmap.png","station_static_pca.png","epoch_selection_by_station.csv",
             "selected_epoch_station_performance.csv","epoch_selection_performance_summary.csv",
+            "primary_performance_comparison.csv","nested_loso_inner_method_scores.csv",
+            "station_best_epoch_plateau_diagnostics.csv","similarity_epoch_gap_diagnostics.csv",
             "target_aware_epoch_conclusion.json",
         )
         missing=[name for name in expected if not (output/name).is_file()]
         if missing: raise RuntimeError(f"analysis outputs missing: {missing}")
         comparison=pd.read_csv(output/"epoch_selection_by_station.csv")
         performance=pd.read_csv(output/"epoch_selection_performance_summary.csv")
-        if len(comparison)!=12 or set(performance.method)!={
-            "global_validation_rmse","macro_station_rmse","target_aware_static_similarity_loso","station_oracle"
-        }:
+        required_methods={"global_validation_rmse","macro_station_rmse","target_aware_static_similarity_loso","target_aware_nested_loso","station_oracle"}
+        if len(comparison)!=12 or not required_methods.issubset(set(performance.method)):
             raise RuntimeError("analysis output rows/methods錯誤")
         print({"analysis_smoke":True,"stations":len(comparison),"epochs":len(epochs),"outputs":len(expected)})
 
