@@ -94,3 +94,9 @@ python evaluate_outer.py
 ```
 
 程式會核對checkpoint的Reduced cluster-aware 60/12 split與train-only scaler。Outer target完全不參與training、validation、scaler或epoch選擇；outer推論只使用60個training stations，12個validation stations不會混入donor pool。輸出資料夾`DL_TCN_CA_v1_outer_60donors_output`包含逐時預測、整體指標、coverage分母與protocol audit。72站refit是另一個後續階段，本程式不會執行。
+
+## Target-aware checkpoint selection離線分析
+
+`analyze_target_aware_epoch.py`只讀取既有`training_history.csv`、`validation_station_metrics_all_epochs.csv`、`best_checkpoint.pt`與49項static features，不修改模型也不重新訓練。它使用checkpoint保存的60站train-only static scaler，對12個validation pseudo-target做leave-one-station-out static similarity加權epoch預測。每個target自己的best epoch不會進入其預測，PM2.5與future observation也不會進入similarity。
+
+程式輸出station×epoch矩陣、similarity矩陣、PCA／heatmap、global／macro／target-aware／oracle逐站表現，以及明確列出12站樣本量與目前只保存best checkpoint的限制。
