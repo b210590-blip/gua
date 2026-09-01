@@ -1,6 +1,6 @@
 # Unseen-station PM2.5 TCN + cross-attention
 
-這是已通過protocol review與pipeline等價測試的Colab版本。固定設定為60 training stations／12 validation stations、24小時history、11個dynamic channels、49個static features、shared causal TCN與target-conditioned cross-attention。程式不建立outer test、不做72站refit，也不搜尋超參數。
+這是已通過protocol review與pipeline等價測試的Colab版本。固定設定為60 training stations／12 validation stations、24小時history、11個dynamic channels、49個static features、shared causal TCN與target-conditioned cross-attention。`train_formal.py`只做60/12模型選擇；`evaluate_outer.py`在模型選擇鎖定後，讀取最佳checkpoint並對1個outer target做一次正式test。此階段不做72站refit，也不搜尋超參數。
 
 ## Colab快速執行
 
@@ -37,7 +37,7 @@
 !python train_formal.py
 ```
 
-目前正式config：learning rate `5e-4`、station-balanced MSE、max epochs `15`、patience `5`。station-balanced權重依60個training stations各自可用樣本數計算，使每站對期望loss的貢獻相同。Colab L4會自動使用batch size `512`、4個輕量index workers、BF16 AMP、TF32與fused AdamW；其他CUDA GPU會依VRAM保守選擇batch。資料、split、特徵與模型架構不變。
+目前鎖定config：learning rate `5e-4`、weight decay `1e-4`、dropout `0.20`、gradient clip `5.0`、station-balanced MSE、max epochs `15`、patience `5`。station-balanced權重依60個training stations各自可用樣本數計算，使每站對期望loss的貢獻相同。Colab L4會自動使用batch size `512`、4個輕量index workers、BF16 AMP、TF32與fused AdamW；其他CUDA GPU會依VRAM保守選擇batch。資料、split、特徵與模型架構不變。
 
 CUDA正式訓練會在每次run開始時，一次性預計算9個raw channels的mask/標準化值，以及所有target-donor的WIND_ALONG/WIND_CROSS；每個epoch只擷取24小時窗口，不重算三角函數，也不預展開全年sample tensor。啟動時會印出預計算秒數與table VRAM。
 
@@ -84,3 +84,13 @@ AQ memory-map cache預設留在`/content/dl_tcn_work`，避免將頻繁cache I/O
 - `best_validation_station_metrics.csv`
 - `validation_station_metrics_all_epochs.csv`
 - `pretraining_sanity.json`
+
+## Outer test（60/12/1，不refit）
+
+模型選擇完成後，將`DL_TCN_SELECTION_CHECKPOINT`指向鎖定實驗的`best_checkpoint.pt`，再執行：
+
+```bash
+python evaluate_outer.py
+```
+
+程式會核對checkpoint的Reduced cluster-aware 60/12 split與train-only scaler。Outer target完全不參與training、validation、scaler或epoch選擇；outer推論只使用60個training stations，12個validation stations不會混入donor pool。輸出資料夾`DL_TCN_CA_v1_outer_60donors_output`包含逐時預測、整體指標、coverage分母與protocol audit。72站refit是另一個後續階段，本程式不會執行。

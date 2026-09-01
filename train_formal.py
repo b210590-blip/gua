@@ -92,6 +92,11 @@ class DeviceFeatureBuilder:
     def __init__(self,donor_pool,cube,max_time_index,timestamps,static,static_scaled,distance,scaler,outer_index,device):
         precompute_started=time.perf_counter()
         cube_np=np.array(cube[:max_time_index+1],dtype="float32",copy=True)
+        # Preserve target labels before hiding outer dynamic values. The formal
+        # 60/12 trainer never requests outer labels; evaluate_outer.py does so
+        # only after model selection is locked.
+        pm25_index=CFG.aq_cube_items.index("PM2.5")
+        labels_np=np.array(cube_np[:,:,pm25_index],dtype="float32",copy=True)
         cube_np[:,outer_index,:]=np.nan
         cube_tensor=torch.from_numpy(cube_np).to(device)
         del cube_np
@@ -102,7 +107,7 @@ class DeviceFeatureBuilder:
         raw_indices=torch.tensor([CFG.aq_cube_items.index(x) for x in CFG.raw_dynamic_items],dtype=torch.long,device=device)
         self.raw_channel_indices=torch.arange(len(CFG.raw_dynamic_items),dtype=torch.long,device=device)
         self.speed_index=CFG.aq_cube_items.index("WIND_SPEED"); self.direction_index=CFG.aq_cube_items.index("WIND_DIREC")
-        self.pm25_index=CFG.aq_cube_items.index("PM2.5"); self.device=device
+        self.pm25_index=pm25_index; self.device=device
         lon=static.longitude.to_numpy(float); lat=static.latitude.to_numpy(float)
         from data_pipeline import bearing_degrees
         bearings=np.stack([bearing_degrees(lon,lat,lon[target],lat[target]) for target in range(len(static))]).astype("float32")
@@ -124,7 +129,8 @@ class DeviceFeatureBuilder:
         self.time_feature_table=torch.from_numpy(tf).to(device)
 
         # Labels and nine raw channels are target-independent. Normalize once.
-        self.labels=cube_tensor[:,:,self.pm25_index].clone()
+        self.labels=torch.from_numpy(labels_np).to(device)
+        del labels_np
         raw=cube_tensor.index_select(2,raw_indices)
         self.raw_mask=torch.isfinite(raw)
         self.raw_values=(raw-self.dynamic_mean[:len(CFG.raw_dynamic_items)])/self.dynamic_std[:len(CFG.raw_dynamic_items)]

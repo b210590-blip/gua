@@ -48,7 +48,7 @@ class Config:
     tcn_hidden: int = 32
     tcn_kernel_size: int = 3
     tcn_dilations: tuple[int, ...] = (1, 2, 4)
-    dropout: float = 0.10
+    dropout: float = float(os.environ.get("DL_TCN_DROPOUT", "0.20"))
     attention_dim: int = 32
     attention_heads: int = 2
     final_hidden: int = 32
@@ -60,7 +60,7 @@ class Config:
     learning_rate: float = float(os.environ.get("DL_TCN_LEARNING_RATE", "5e-4"))
     weight_decay: float = float(os.environ.get("DL_TCN_WEIGHT_DECAY", "1e-4"))
     loss_name: str = "station_balanced_mse"
-    gradient_clip_norm: float = 5.0
+    gradient_clip_norm: float = float(os.environ.get("DL_TCN_GRADIENT_CLIP_NORM", "5.0"))
     smoke_epochs: int = 2
     smoke_max_train_batches: int = 20
     smoke_max_val_batches: int = 10
@@ -75,6 +75,7 @@ class Config:
     max_epochs: int = int(os.environ.get("DL_TCN_MAX_EPOCHS", "15"))
     early_stopping_patience: int = int(os.environ.get("DL_TCN_PATIENCE", "5"))
     formal_output_dirname: str = "DL_TCN_CA_v1_formal_lr5e-4_station_balanced_output"
+    outer_output_dirname: str = "DL_TCN_CA_v1_outer_60donors_output"
     progress_every_batches: int = 1000
     formal_num_workers: int = int(os.environ.get("DL_TCN_NUM_WORKERS", "0"))
     prefetch_factor: int = int(os.environ.get("DL_TCN_PREFETCH_FACTOR", "4"))
