@@ -154,7 +154,7 @@ OOF評估時每次完整排除被預測站的類別與epoch曲線：分類器只
 
 `analyze_interpretable_epoch_rules.py`不使用CART、Extra Trees或其他分類模型。規則只計算兩個可直接閱讀的分數：近距離森林／NDVI的平均百分位，以及近距離交通／商業／建成／住宅的平均百分位。兩者相減後依參考站分布粗分三個static profile groups。
 
-逐站檢查時，被檢查站完全不參與自己的百分位、門檻或epoch校準。目標被分組後，epoch由其餘71站中同一static group的15-epoch曲線決定；程式同時比較「最小平均station regret」與「成員最佳epoch中位數」兩個透明規則。輸出會逐站列出分數、四項最強判斷依據、真正最佳epoch、規則選定epoch與RMSE regret，並另外保存49項static和最佳epoch的關聯表。規則特徵源自看過72站後的development分析，因此不能冒充完全獨立outer驗證。
+六個fold是六次獨立訓練，因此raw epoch不直接跨fold平均。逐站檢查時，先以同fold另外11個validation站取得該次訓練的reference epoch，再將每站最佳epoch轉成fold-relative offset。被檢查站完全不參與自己的百分位、門檻、fold reference或offset校準；同fold其他參考站的reference也會額外排除該target，因此由10站而非偷偷包含target的11站計算。目標被分組後，程式比較「同組station regret最低的offset」與「同組最佳offset中位數」，最後把offset加回該次訓練的reference epoch。輸出會逐站列出fold、reference epoch、真實／預測offset、static分數、判斷依據與RMSE regret。規則特徵源自看過72站後的development分析，因此不能冒充完全獨立outer驗證。
 
 ```python
 %env DL_TCN_CROSSFIT_ROOT=/content/crossfit_target_conditioned_snapshots

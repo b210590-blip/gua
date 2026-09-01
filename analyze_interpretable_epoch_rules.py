@@ -43,12 +43,14 @@ def load_history(root: Path) -> pd.DataFrame:
     files = sorted(root.glob("fold_*/validation_station_metrics_all_epochs.csv"))
     if len(files) != 6:
         raise FileNotFoundError(f"應有6個fold，實際找到{len(files)}個: {root}")
-    frame = pd.concat(
-        [pd.read_csv(path, encoding="utf-8-sig") for path in files],
-        ignore_index=True,
-    )
+    frames = []
+    for path in files:
+        part = pd.read_csv(path, encoding="utf-8-sig")
+        part["fold"] = int(path.parent.name.split("_")[-1])
+        frames.append(part)
+    frame = pd.concat(frames, ignore_index=True)
     required = {
-        "station_index", "siteid", "sitename", "epoch",
+        "station_index", "siteid", "sitename", "fold", "epoch",
         "n", "mae", "rmse", "r2", "bias",
     }
     missing = required - set(frame.columns)
@@ -71,7 +73,7 @@ def build_oracle(history: pd.DataFrame) -> pd.DataFrame:
         .first()
     )
     oracle = oracle[
-        ["station_index", "siteid", "sitename", "epoch", "rmse", "r2"]
+        ["station_index", "siteid", "sitename", "fold", "epoch", "rmse", "r2"]
     ].rename(
         columns={
             "epoch": "true_best_epoch",
@@ -139,37 +141,71 @@ def classify(contrast: float, lower: float, upper: float) -> str:
     return "middle"
 
 
-def choose_group_epochs(
+def fold_reference_epoch_excluding_station(
+    history: pd.DataFrame,
+    station: int,
+    additionally_excluded: int | None = None,
+) -> int:
+    folds = history.loc[history.station_index == station, "fold"].unique()
+    if len(folds) != 1:
+        raise RuntimeError(f"station={station} fold不唯一")
+    fold = int(folds[0])
+    keep = (history.fold == fold) & (history.station_index != station)
+    if additionally_excluded is not None:
+        keep &= history.station_index != int(additionally_excluded)
+    peers = history.loc[keep]
+    excluded_is_same_fold = (
+        additionally_excluded is not None
+        and bool(
+            (history.loc[history.station_index == additionally_excluded, "fold"] == fold)
+            .any()
+        )
+    )
+    expected = 10 if excluded_is_same_fold else 11
+    if peers.station_index.nunique() != expected:
+        raise RuntimeError(
+            f"station={station} fold reference應有{expected}站，"
+            f"實際{peers.station_index.nunique()}站"
+        )
+    return int(peers.groupby("epoch").rmse.mean().idxmin())
+
+
+def choose_group_offsets(
     history: pd.DataFrame,
     oracle: pd.DataFrame,
+    reference_epochs: dict[int, int],
     reference_ids: np.ndarray,
     reference_groups: np.ndarray,
     target_group: str,
 ) -> tuple[int, int, int]:
-    """Choose epochs using only same-rule-group reference stations.
-
-    curve_epoch minimizes mean per-station RMSE regret, so difficult stations
-    cannot dominate merely because their absolute RMSE is large.
-    median_epoch is the transparent median of reference best epochs.
-    """
+    """Choose fold-relative offsets from same-static-group reference stations."""
     members = reference_ids[reference_groups == target_group]
     if not len(members):
         raise RuntimeError(f"reference中沒有{target_group}群")
-    curves = (
-        history.loc[history.station_index.isin(members)]
-        .pivot(index="station_index", columns="epoch", values="rmse")
-        .reindex(columns=np.arange(1, 16))
+    oracle_indexed = oracle.set_index("station_index")
+    history_indexed = history.set_index(["station_index", "epoch"])
+    true_offsets = np.asarray(
+        [
+            int(oracle_indexed.loc[int(member), "true_best_epoch"])
+            - int(reference_epochs[int(member)])
+            for member in members
+        ],
+        dtype="float64",
     )
-    if curves.isna().any().any():
-        raise RuntimeError("group epoch curves不完整")
-    regrets = curves.sub(curves.min(axis=1), axis=0)
-    curve_epoch = int(regrets.mean(axis=0).idxmin())
-    best_epochs = (
-        oracle.set_index("station_index").loc[members, "true_best_epoch"]
-        .to_numpy("float64")
-    )
-    median_epoch = int(np.floor(np.median(best_epochs) + 0.5))
-    return curve_epoch, median_epoch, int(len(members))
+    median_offset = int(np.floor(np.median(true_offsets) + 0.5))
+
+    candidates = []
+    for offset in range(-14, 15):
+        regrets = []
+        for member in members:
+            member = int(member)
+            epoch = int(np.clip(reference_epochs[member] + offset, 1, 15))
+            rmse = float(history_indexed.loc[(member, epoch), "rmse"])
+            oracle_rmse = float(oracle_indexed.loc[member, "oracle_rmse"])
+            regrets.append(rmse - oracle_rmse)
+        candidates.append((float(np.mean(regrets)), abs(offset), offset))
+    regret_offset = int(min(candidates)[2])
+    return regret_offset, median_offset, int(len(members))
 
 
 def evidence_text(percentile_row: pd.Series) -> str:
@@ -229,7 +265,7 @@ def performance_summary(
     sum_y = sum(truth_stats[int(i)]["sum_y"] for i in rows.station_index)
     sum_y2 = sum(truth_stats[int(i)]["sum_y2"] for i in rows.station_index)
     sst = float(sum_y2 - sum_y * sum_y / total_n)
-    return {
+    result = {
         "method": method,
         "stations": int(len(rows)),
         "regime_accuracy": float(rows.regime_correct.mean()),
@@ -244,6 +280,9 @@ def performance_summary(
         "pooled_r2_exact": float(1.0 - sse / sst),
         "mean_rmse_regret_vs_oracle": float(rows.rmse_regret_vs_oracle.mean()),
     }
+    if "offset_error_abs" in rows.columns:
+        result["mean_absolute_offset_error"] = float(rows.offset_error_abs.mean())
+    return result
 
 
 def static_association_table(
@@ -274,7 +313,7 @@ def static_association_table(
 
 def main() -> None:
     if CFG.max_epochs != 15:
-        raise RuntimeError("透明規則固定對應epoch 1..15，請設定DL_TCN_MAX_EPOCHS=15")
+        raise RuntimeError("fold-relative規則需要完整epoch 1..15，請設定DL_TCN_MAX_EPOCHS=15")
     root = Path(
         os.environ.get(
             "DL_TCN_CROSSFIT_ROOT",
@@ -315,14 +354,29 @@ def main() -> None:
             [classify(float(value), lower, upper) for value in reference_contrast],
             dtype=str,
         )
-        curve_epoch, median_epoch, group_reference_stations = choose_group_epochs(
+        # Strict outer LOSO: target station is excluded not only from its own
+        # fold reference, but also from every calibration station's reference.
+        reference_epochs = {
+            int(member): fold_reference_epoch_excluding_station(
+                history, int(member), additionally_excluded=int(station)
+            )
+            for member in reference_ids
+        }
+        regret_offset, median_offset, group_reference_stations = choose_group_offsets(
             history,
             oracle,
+            reference_epochs,
             reference_ids,
             reference_groups,
             predicted_regime,
         )
         oracle_row = oracle.loc[oracle.station_index == station].iloc[0]
+        target_reference_epoch = fold_reference_epoch_excluding_station(
+            history, int(station)
+        )
+        curve_epoch = int(np.clip(target_reference_epoch + regret_offset, 1, 15))
+        median_epoch = int(np.clip(target_reference_epoch + median_offset, 1, 15))
+        true_offset = int(oracle_row.true_best_epoch) - target_reference_epoch
         common = {
             "station_index": int(station),
             "siteid": str(oracle_row.siteid),
@@ -331,8 +385,13 @@ def main() -> None:
             "true_regime": str(oracle_row.true_regime),
             "predicted_regime": predicted_regime,
             "regime_correct": predicted_regime == oracle_row.true_regime,
+            "fold": int(oracle_row.fold),
+            "fold_reference_epoch_excluding_target": target_reference_epoch,
+            "true_fold_relative_offset": true_offset,
             "curve_selected_epoch": curve_epoch,
+            "curve_selected_offset": regret_offset,
             "median_selected_epoch": median_epoch,
+            "median_selected_offset": median_offset,
             "group_reference_stations": group_reference_stations,
             "green_score": float(score_row.green_score),
             "urban_score": float(score_row.urban_score),
@@ -348,15 +407,18 @@ def main() -> None:
         }
         station_rows.append(common)
         for method, selected_epoch in (
-            ("same_group_mean_regret_curve_loso", curve_epoch),
-            ("same_group_median_best_epoch_loso", median_epoch),
+            ("fold_relative_same_group_regret_loso", curve_epoch),
+            ("fold_relative_same_group_median_loso", median_epoch),
         ):
+            selected_offset = selected_epoch - target_reference_epoch
             metric = select_metric(history, int(station), selected_epoch)
             metric_rows.append(
                 {
                     **common,
                     "method": method,
                     "selected_epoch": selected_epoch,
+                    "selected_fold_relative_offset": selected_offset,
+                    "offset_error_abs": abs(selected_offset - true_offset),
                     "epoch_error_abs": abs(
                         selected_epoch - int(oracle_row.true_best_epoch)
                     ),
@@ -411,6 +473,12 @@ def main() -> None:
             true_epoch_median=("true_best_epoch", "median"),
             true_epoch_min=("true_best_epoch", "min"),
             true_epoch_max=("true_best_epoch", "max"),
+            reference_epoch_mean=("fold_reference_epoch_excluding_target", "mean"),
+            true_offset_mean=("true_fold_relative_offset", "mean"),
+            true_offset_median=("true_fold_relative_offset", "median"),
+            selected_offset_mean=("selected_fold_relative_offset", "mean"),
+            selected_offset_min=("selected_fold_relative_offset", "min"),
+            selected_offset_max=("selected_fold_relative_offset", "max"),
             selected_epoch_mean=("selected_epoch", "mean"),
             selected_epoch_min=("selected_epoch", "min"),
             selected_epoch_max=("selected_epoch", "max"),
@@ -456,6 +524,17 @@ def main() -> None:
         index=False,
         encoding="utf-8-sig",
     )
+    station_table[
+        [
+            "station_index", "siteid", "sitename", "fold",
+            "fold_reference_epoch_excluding_target", "true_best_epoch",
+            "true_fold_relative_offset",
+        ]
+    ].to_csv(
+        output / "fold_relative_epoch_labels.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     definition = {
         "green_features": list(GREEN_FEATURES),
         "urban_features": list(URBAN_FEATURES),
@@ -466,16 +545,23 @@ def main() -> None:
             "early": f"score >= reference {UPPER_QUANTILE:.0%} quantile",
         },
         "epoch_calibration": {
-            "same_group_mean_regret_curve_loso": (
-                "Within the target's transparent static group, choose the epoch "
-                "with minimum mean per-station RMSE regret among reference stations."
+            "fold_reference": (
+                "For each pseudo-target, the reference epoch is chosen from the "
+                "other 11 validation stations in the same independently trained fold."
             ),
-            "same_group_median_best_epoch_loso": (
-                "Within the target's transparent static group, choose the rounded "
-                "median reference-station best epoch."
+            "fold_relative_same_group_regret_loso": (
+                "Choose a fold-relative offset minimizing mean station regret among "
+                "same-static-group reference stations, then add it to the target fold reference."
+            ),
+            "fold_relative_same_group_median_loso": (
+                "Use the median fold-relative best-epoch offset among same-static-group "
+                "reference stations, then add it to the target fold reference."
             ),
         },
-        "evaluation": "Each station is excluded from percentile reference and thresholds.",
+        "evaluation": (
+            "Each station is excluded from static percentiles, thresholds, its fold "
+            "reference epoch, and offset calibration until final scoring."
+        ),
         "important_limitation": (
             "The nine rule features were chosen after inspecting all 72 development stations. "
             "This is an interpretable development analysis, not a fully independent outer evaluation."
