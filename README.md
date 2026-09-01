@@ -100,3 +100,5 @@ python evaluate_outer.py
 `analyze_target_aware_epoch.py`只讀取既有`training_history.csv`、`validation_station_metrics_all_epochs.csv`、`best_checkpoint.pt`與49項static features，不修改模型也不重新訓練。它使用checkpoint保存的60站train-only static scaler，對12個validation pseudo-target做leave-one-station-out static similarity加權epoch預測。每個target自己的best epoch不會進入其預測，PM2.5與future observation也不會進入similarity。
 
 程式輸出station×epoch矩陣、similarity矩陣、PCA／heatmap、global／macro／target-aware／oracle逐站表現，以及明確列出12站樣本量與目前只保存best checkpoint的限制。
+
+修正版同時保留原始49維RBF-all方法作失敗baseline，並加入60站train-only PCA、target對固定60 donors的距離／密度摘要、固定k=1/3/5近鄰及cluster-restricted候選。主要`target_aware_nested_loso`結果會在每個held-out validation target之外，再用其餘11站做內層LOSO選擇相似度方法，因此連方法選擇也不會看到held-out target的best epoch。
