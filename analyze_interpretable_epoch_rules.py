@@ -27,7 +27,6 @@ URBAN_FEATURES = (
 RULE_FEATURES = GREEN_FEATURES + URBAN_FEATURES
 LOWER_QUANTILE = 0.35
 UPPER_QUANTILE = 0.70
-REGIME_EPOCH = {"early": 3, "middle": 9, "late": 14}
 
 
 def epoch_regime(epoch: int) -> str:
@@ -138,6 +137,39 @@ def classify(contrast: float, lower: float, upper: float) -> str:
     if contrast <= lower:
         return "late"
     return "middle"
+
+
+def choose_group_epochs(
+    history: pd.DataFrame,
+    oracle: pd.DataFrame,
+    reference_ids: np.ndarray,
+    reference_groups: np.ndarray,
+    target_group: str,
+) -> tuple[int, int, int]:
+    """Choose epochs using only same-rule-group reference stations.
+
+    curve_epoch minimizes mean per-station RMSE regret, so difficult stations
+    cannot dominate merely because their absolute RMSE is large.
+    median_epoch is the transparent median of reference best epochs.
+    """
+    members = reference_ids[reference_groups == target_group]
+    if not len(members):
+        raise RuntimeError(f"reference中沒有{target_group}群")
+    curves = (
+        history.loc[history.station_index.isin(members)]
+        .pivot(index="station_index", columns="epoch", values="rmse")
+        .reindex(columns=np.arange(1, 16))
+    )
+    if curves.isna().any().any():
+        raise RuntimeError("group epoch curves不完整")
+    regrets = curves.sub(curves.min(axis=1), axis=0)
+    curve_epoch = int(regrets.mean(axis=0).idxmin())
+    best_epochs = (
+        oracle.set_index("station_index").loc[members, "true_best_epoch"]
+        .to_numpy("float64")
+    )
+    median_epoch = int(np.floor(np.median(best_epochs) + 0.5))
+    return curve_epoch, median_epoch, int(len(members))
 
 
 def evidence_text(percentile_row: pd.Series) -> str:
@@ -279,9 +311,18 @@ def main() -> None:
         predicted_regime = classify(
             float(score_row.green_minus_urban), lower, upper
         )
-        selected_epoch = REGIME_EPOCH[predicted_regime]
+        reference_groups = np.asarray(
+            [classify(float(value), lower, upper) for value in reference_contrast],
+            dtype=str,
+        )
+        curve_epoch, median_epoch, group_reference_stations = choose_group_epochs(
+            history,
+            oracle,
+            reference_ids,
+            reference_groups,
+            predicted_regime,
+        )
         oracle_row = oracle.loc[oracle.station_index == station].iloc[0]
-        metric = select_metric(history, int(station), selected_epoch)
         common = {
             "station_index": int(station),
             "siteid": str(oracle_row.siteid),
@@ -290,8 +331,9 @@ def main() -> None:
             "true_regime": str(oracle_row.true_regime),
             "predicted_regime": predicted_regime,
             "regime_correct": predicted_regime == oracle_row.true_regime,
-            "selected_epoch": selected_epoch,
-            "epoch_error_abs": abs(selected_epoch - int(oracle_row.true_best_epoch)),
+            "curve_selected_epoch": curve_epoch,
+            "median_selected_epoch": median_epoch,
+            "group_reference_stations": group_reference_stations,
             "green_score": float(score_row.green_score),
             "urban_score": float(score_row.urban_score),
             "green_minus_urban": float(score_row.green_minus_urban),
@@ -305,25 +347,38 @@ def main() -> None:
             },
         }
         station_rows.append(common)
-        metric_rows.append(
-            {
-                **common,
-                **{key: metric[key] for key in ("n", "mae", "rmse", "r2", "bias")},
-                "oracle_rmse": float(oracle_row.oracle_rmse),
-                "rmse_regret_vs_oracle": float(
-                    metric["rmse"] - oracle_row.oracle_rmse
-                ),
-            }
-        )
+        for method, selected_epoch in (
+            ("same_group_mean_regret_curve_loso", curve_epoch),
+            ("same_group_median_best_epoch_loso", median_epoch),
+        ):
+            metric = select_metric(history, int(station), selected_epoch)
+            metric_rows.append(
+                {
+                    **common,
+                    "method": method,
+                    "selected_epoch": selected_epoch,
+                    "epoch_error_abs": abs(
+                        selected_epoch - int(oracle_row.true_best_epoch)
+                    ),
+                    **{
+                        key: metric[key]
+                        for key in ("n", "mae", "rmse", "r2", "bias")
+                    },
+                    "oracle_rmse": float(oracle_row.oracle_rmse),
+                    "rmse_regret_vs_oracle": float(
+                        metric["rmse"] - oracle_row.oracle_rmse
+                    ),
+                }
+            )
         if (position + 1) % 12 == 0:
             print(f"Transparent static rule LOSO: {position + 1}/72", flush=True)
 
     station_table = pd.DataFrame(station_rows)
     metrics = pd.DataFrame(metric_rows)
     truth_stats = truth_sufficient_statistics(root)
-    summaries = [
-        performance_summary(metrics, truth_stats, "transparent_static_rule_loso")
-    ]
+    summaries = []
+    for method, rows in metrics.groupby("method", sort=False):
+        summaries.append(performance_summary(rows, truth_stats, str(method)))
 
     oracle_metrics = []
     for _, row in oracle.iterrows():
@@ -348,7 +403,7 @@ def main() -> None:
     )
 
     group_audit = (
-        metrics.groupby("predicted_regime", as_index=False)
+        metrics.groupby(["method", "predicted_regime"], as_index=False)
         .agg(
             stations=("station_index", "size"),
             regime_accuracy=("regime_correct", "mean"),
@@ -356,7 +411,9 @@ def main() -> None:
             true_epoch_median=("true_best_epoch", "median"),
             true_epoch_min=("true_best_epoch", "min"),
             true_epoch_max=("true_best_epoch", "max"),
-            selected_epoch=("selected_epoch", "first"),
+            selected_epoch_mean=("selected_epoch", "mean"),
+            selected_epoch_min=("selected_epoch", "min"),
+            selected_epoch_max=("selected_epoch", "max"),
             macro_rmse=("rmse", "mean"),
             mean_regret=("rmse_regret_vs_oracle", "mean"),
         )
@@ -408,7 +465,16 @@ def main() -> None:
             "middle": "between thresholds",
             "early": f"score >= reference {UPPER_QUANTILE:.0%} quantile",
         },
-        "representative_epoch": REGIME_EPOCH,
+        "epoch_calibration": {
+            "same_group_mean_regret_curve_loso": (
+                "Within the target's transparent static group, choose the epoch "
+                "with minimum mean per-station RMSE regret among reference stations."
+            ),
+            "same_group_median_best_epoch_loso": (
+                "Within the target's transparent static group, choose the rounded "
+                "median reference-station best epoch."
+            ),
+        },
         "evaluation": "Each station is excluded from percentile reference and thresholds.",
         "important_limitation": (
             "The nine rule features were chosen after inspecting all 72 development stations. "
