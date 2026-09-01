@@ -1,0 +1,375 @@
+from __future__ import annotations
+
+import json
+import math
+import platform
+import random
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader
+
+from config import CFG
+from data_pipeline import (
+    ColdStartStationDataset,
+    ColdStartIndexDataset,
+    VectorizedFormalCollator,
+    build_or_load_hourly_cube,
+    choose_split,
+    collate_variable_donors,
+    fit_train_only_scaler,
+    haversine_matrix,
+    load_static,
+    standardize_static,
+    time_features,
+)
+from model import TCNTargetCrossAttention
+from sanity_check import audit_dataset, smoke_forward
+
+
+def seed_all(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def resolve_target(static: pd.DataFrame, name: str) -> int:
+    hit=np.flatnonzero(
+        (static.siteid.astype(str).to_numpy()==str(name))
+        | (static.sitename.astype(str).to_numpy()==str(name))
+    )
+    if len(hit)!=1:
+        raise ValueError(f"target {name!r} 對到{len(hit)}站")
+    return int(hit[0])
+
+
+def make_loader(dataset, shuffle: bool) -> DataLoader:
+    kwargs={
+        "dataset":dataset,
+        "batch_size":CFG.batch_size,
+        "shuffle":shuffle,
+        "num_workers":CFG.formal_num_workers,
+        "pin_memory":CFG.device.type=="cuda",
+        "collate_fn":collate_variable_donors,
+    }
+    if CFG.formal_num_workers>0:
+        kwargs.update(persistent_workers=True,prefetch_factor=2)
+    return DataLoader(**kwargs)
+
+
+def make_vectorized_loader(source_dataset,donor_pool,cube,timestamps,static,static_scaled,distance,scaler,shuffle):
+    index_dataset=ColdStartIndexDataset(source_dataset)
+    collator=VectorizedFormalCollator(donor_pool,cube,timestamps,static,static_scaled,distance,scaler)
+    return DataLoader(index_dataset,batch_size=CFG.batch_size,shuffle=shuffle,num_workers=0,
+                      pin_memory=CFG.device.type=="cuda",collate_fn=collator)
+
+
+def collate_indices(batch):
+    return {"target_idx":torch.tensor([row[0] for row in batch],dtype=torch.long),
+            "time_idx":torch.tensor([row[1] for row in batch],dtype=torch.long)}
+
+
+def make_index_loader(source_dataset,shuffle):
+    return DataLoader(ColdStartIndexDataset(source_dataset),batch_size=CFG.batch_size,shuffle=shuffle,
+                      num_workers=0,pin_memory=True,collate_fn=collate_indices)
+
+
+class DeviceFeatureBuilder:
+    """Construct the reviewed features on CUDA from a small train-period cube."""
+    def __init__(self,donor_pool,cube,max_time_index,timestamps,static,static_scaled,distance,scaler,outer_index,device):
+        cube_np=np.array(cube[:max_time_index+1],dtype="float32",copy=True)
+        cube_np[:,outer_index,:]=np.nan
+        self.cube=torch.from_numpy(cube_np).to(device)
+        donor_pool=np.asarray(donor_pool,dtype="int64")
+        self.static_scaled=torch.as_tensor(static_scaled,dtype=torch.float32,device=device)
+        self.dynamic_mean=torch.as_tensor(scaler.dynamic_mean,dtype=torch.float32,device=device)
+        self.dynamic_std=torch.as_tensor(scaler.dynamic_std,dtype=torch.float32,device=device)
+        self.raw_indices=torch.tensor([CFG.aq_cube_items.index(x) for x in CFG.raw_dynamic_items],dtype=torch.long,device=device)
+        self.speed_index=CFG.aq_cube_items.index("WIND_SPEED"); self.direction_index=CFG.aq_cube_items.index("WIND_DIREC")
+        self.pm25_index=CFG.aq_cube_items.index("PM2.5"); self.device=device
+        lon=static.longitude.to_numpy(float); lat=static.latitude.to_numpy(float)
+        from data_pipeline import bearing_degrees
+        bearings=np.stack([bearing_degrees(lon,lat,lon[target],lat[target]) for target in range(len(static))]).astype("float32")
+        max_donors=len(donor_pool); donor_table=np.full((len(static),max_donors),-1,dtype="int64")
+        donor_counts=np.zeros(len(static),dtype="int64"); geometry_table=np.zeros((len(static),max_donors,3),dtype="float32")
+        sin_bearing=np.zeros((len(static),max_donors),dtype="float32"); cos_bearing=np.zeros_like(sin_bearing)
+        bearing_table=np.zeros((len(static),max_donors),dtype="float32")
+        donor_static_table=np.zeros((len(static),max_donors,static_scaled.shape[1]),dtype="float32")
+        for target in range(len(static)):
+            donors=donor_pool[donor_pool!=target]; count=len(donors); donor_counts[target]=count; donor_table[target,:count]=donors
+            bearing=bearings[target,donors]; sin_b=np.sin(np.deg2rad(bearing)).astype("float32"); cos_b=np.cos(np.deg2rad(bearing)).astype("float32")
+            bearing_table[target,:count]=bearing
+            sin_bearing[target,:count]=sin_b; cos_bearing[target,:count]=cos_b
+            geometry_table[target,:count]=np.stack([np.log1p(distance[target,donors]/1000.0),sin_b,cos_b],axis=-1).astype("float32")
+            donor_static_table[target,:count]=static_scaled[donors]
+        self.donor_table=torch.from_numpy(donor_table).to(device)
+        self.donor_counts=torch.from_numpy(donor_counts).to(device)
+        self.geometry_table=torch.from_numpy(geometry_table).to(device)
+        self.bearing_table=torch.from_numpy(bearing_table).to(device)
+        self.sin_bearing_table=torch.from_numpy(sin_bearing).to(device)
+        self.cos_bearing_table=torch.from_numpy(cos_bearing).to(device)
+        self.donor_static_table=torch.from_numpy(donor_static_table).to(device)
+        self.history_offsets=torch.arange(CFG.history_hours,device=device)-CFG.history_hours+1
+        self.zero=torch.zeros((),device=device,dtype=torch.float32)
+        tf=np.stack([time_features(ts) for ts in timestamps[:max_time_index+1]]).astype("float32")
+        self.time_feature_table=torch.from_numpy(tf).to(device)
+
+    def __call__(self,index_batch):
+        targets=index_batch["target_idx"].to(self.device,non_blocking=True)
+        current=index_batch["time_idx"].to(self.device,non_blocking=True)
+        counts=self.donor_counts[targets]
+        if not torch.all(counts==counts[0]): raise RuntimeError("同一batch donor數不一致")
+        donor_count=int(counts[0].item()); donors=self.donor_table[targets,:donor_count]
+        history=current[:,None]+self.history_offsets[None,:]
+        if int(history.min().item())<0: raise RuntimeError("AQ cube起點不足24h history")
+        raw=self.cube[history[:,:,None,None],donors[:,None,:,None],self.raw_indices[None,None,None,:]]
+        speed=self.cube[history[:,:,None],donors[:,None,:],self.speed_index]
+        wfrom=self.cube[history[:,:,None],donors[:,None,:],self.direction_index]
+        bearing=self.bearing_table[targets,:donor_count]
+        delta=torch.deg2rad(torch.remainder(wfrom+180.0,360.0)-bearing[:,None,:])
+        along=speed*torch.cos(delta); cross=speed*torch.sin(delta)
+        values=torch.cat([raw,torch.stack([along,cross],dim=-1)],dim=-1).permute(0,2,1,3).contiguous()
+        mask=torch.isfinite(values).to(torch.float32)
+        values=(values-self.dynamic_mean[None,None,None,:])/self.dynamic_std[None,None,None,:]
+        values=torch.where(mask>0,values,self.zero)
+        all_missing=mask.sum(dim=(2,3))==0
+        geometry=self.geometry_table[targets,:donor_count]
+        labels=self.cube[current,targets,self.pm25_index]
+        if not torch.isfinite(labels).all(): raise RuntimeError("index batch包含缺失target label")
+        return {
+            "values":values,"mask":mask,"donor_static":self.donor_static_table[targets,:donor_count],"geometry":geometry,
+            "donor_padding_mask":torch.zeros(donors.shape,dtype=torch.bool,device=self.device),
+            "donor_all_missing":all_missing,"target_static":self.static_scaled[targets],
+            "time_features":self.time_feature_table[current],"label":labels,
+            "target_idx":targets,"time_idx":current,"donor_indices":donors,
+        }
+
+
+def move_batch(batch: dict, device: torch.device) -> dict:
+    return {
+        key:(value.to(device,non_blocking=True) if isinstance(value,torch.Tensor) else value)
+        for key,value in batch.items()
+    }
+
+
+def make_grad_scaler(enabled: bool):
+    try:
+        return torch.amp.GradScaler("cuda",enabled=enabled,init_scale=CFG.amp_init_scale,growth_interval=CFG.amp_growth_interval)
+    except (AttributeError,TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled,init_scale=CFG.amp_init_scale,growth_interval=CFG.amp_growth_interval)
+
+
+def regression_metrics(y_true: np.ndarray,y_pred: np.ndarray) -> dict[str,float]:
+    y_true=np.asarray(y_true,dtype="float64"); y_pred=np.asarray(y_pred,dtype="float64")
+    err=y_pred-y_true
+    mae=float(np.mean(np.abs(err)))
+    rmse=float(np.sqrt(np.mean(np.square(err))))
+    bias=float(np.mean(err))
+    denom=float(np.sum(np.square(y_true-y_true.mean())))
+    r2=float(1.0-np.sum(np.square(err))/denom) if denom>0 else float("nan")
+    return {"mae":mae,"rmse":rmse,"r2":r2,"bias":bias}
+
+
+def train_epoch(model,loader,optimizer,grad_scaler,device,epoch: int,feature_builder=None) -> float:
+    model.train(); amp_enabled=CFG.use_amp and device.type=="cuda"
+    loss_sum=0.0; sample_count=0; started=time.perf_counter()
+    for batch_number,batch in enumerate(loader,start=1):
+        batch=feature_builder(batch) if feature_builder is not None else move_batch(batch,device)
+        if batch_number==1 and device.type=="cuda":
+            if batch["values"].device.type!="cuda" or next(model.parameters()).device.type!="cuda":
+                raise RuntimeError("CUDA available但model或batch沒有移到GPU")
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device.type,enabled=amp_enabled):
+            pred,_=model(
+                batch["values"],batch["mask"],batch["donor_static"],batch["geometry"],
+                batch["donor_padding_mask"],batch["target_static"],batch["time_features"],
+            )
+            loss=torch.nn.functional.mse_loss(pred,batch["label"])
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"epoch {epoch} batch {batch_number}: loss非finite")
+        grad_scaler.scale(loss).backward()
+        grad_scaler.unscale_(optimizer)
+        grad_norm=torch.nn.utils.clip_grad_norm_(model.parameters(),CFG.gradient_clip_norm)
+        if not torch.isfinite(grad_norm):
+            raise RuntimeError(f"epoch {epoch} batch {batch_number}: gradient norm非finite")
+        grad_scaler.step(optimizer); grad_scaler.update()
+        n=int(batch["label"].numel()); loss_sum+=float(loss.detach().cpu())*n; sample_count+=n
+        if CFG.progress_every_batches>0 and batch_number%CFG.progress_every_batches==0:
+            elapsed=time.perf_counter()-started
+            rate=sample_count/max(elapsed,1e-9)
+            print(f"  epoch {epoch} train {batch_number:,}/{len(loader):,} batches | {sample_count:,} samples | {rate:,.1f} samples/s",flush=True)
+    if sample_count!=len(loader.dataset):
+        raise RuntimeError(f"training coverage錯誤: {sample_count} != {len(loader.dataset)}")
+    return loss_sum/sample_count
+
+
+@torch.no_grad()
+def validate_epoch(model,loader,device,static,timestamps,epoch: int,feature_builder=None):
+    model.eval(); amp_enabled=CFG.use_amp and device.type=="cuda"
+    truths=[]; predictions=[]; station_indices=[]; time_indices=[]; seen=0; started=time.perf_counter()
+    for batch_number,batch in enumerate(loader,start=1):
+        batch=feature_builder(batch) if feature_builder is not None else move_batch(batch,device)
+        with torch.autocast(device_type=device.type,enabled=amp_enabled):
+            pred,_=model(
+                batch["values"],batch["mask"],batch["donor_static"],batch["geometry"],
+                batch["donor_padding_mask"],batch["target_static"],batch["time_features"],
+            )
+        if not torch.isfinite(pred).all():
+            raise RuntimeError(f"epoch {epoch} validation prediction非finite")
+        truths.append(batch["label"].float().cpu().numpy())
+        predictions.append(pred.float().cpu().numpy())
+        station_indices.append(batch["target_idx"].cpu().numpy())
+        time_indices.append(batch["time_idx"].cpu().numpy())
+        seen+=int(batch["label"].numel())
+        if CFG.progress_every_batches>0 and batch_number%CFG.progress_every_batches==0:
+            elapsed=time.perf_counter()-started
+            print(f"  epoch {epoch} valid {batch_number:,}/{len(loader):,} batches | {seen:,} samples | {seen/max(elapsed,1e-9):,.1f} samples/s",flush=True)
+    if seen!=len(loader.dataset):
+        raise RuntimeError(f"validation coverage錯誤: {seen} != {len(loader.dataset)}")
+    y=np.concatenate(truths); p=np.concatenate(predictions); s=np.concatenate(station_indices); ti=np.concatenate(time_indices)
+    overall=regression_metrics(y,p); station_rows=[]
+    for station in sorted(np.unique(s)):
+        keep=s==station; metrics=regression_metrics(y[keep],p[keep])
+        station_rows.append({
+            "station_index":int(station),"siteid":str(static.loc[station,"siteid"]),
+            "sitename":str(static.loc[station,"sitename"]),"n":int(keep.sum()),**metrics,
+        })
+    overall["macro_station_rmse"]=float(np.mean([row["rmse"] for row in station_rows]))
+    prediction_frame=pd.DataFrame({
+        "station_index":s.astype(int),
+        "timestamp":pd.DatetimeIndex(timestamps[ti]),
+        "y_true":y.astype("float32"),
+        "y_pred":p.astype("float32"),
+    })
+    return overall,pd.DataFrame(station_rows),prediction_frame
+
+
+def cpu_state_dict(model) -> dict:
+    return {name:tensor.detach().cpu() for name,tensor in model.state_dict().items()}
+
+
+def serializable_config() -> dict:
+    result={}
+    for key,value in asdict(CFG).items():
+        if isinstance(value,Path): result[key]=str(value)
+        elif isinstance(value,torch.device): result[key]=str(value)
+        else: result[key]=value
+    return result
+
+
+def main() -> None:
+    seed_all(CFG.seed)
+    device=CFG.device
+    output_dir=CFG.formal_output_root/CFG.formal_output_dirname
+    output_dir.mkdir(parents=True,exist_ok=True)
+    if not CFG.aq_data_dir.is_dir(): raise FileNotFoundError(f"AQ資料夾不存在: {CFG.aq_data_dir}")
+
+    static,clusters,static_cols=load_static()
+    outer=resolve_target(static,CFG.target_site)
+    train_idx,val_idx=choose_split(clusters,outer)
+    if outer in train_idx or outer in val_idx: raise RuntimeError("outer target leakage")
+    cube,timestamps=build_or_load_hourly_cube(static)
+    distance=haversine_matrix(static.longitude,static.latitude)
+    scaler=fit_train_only_scaler(cube,timestamps,static,static_cols,train_idx)
+    static_scaled=standardize_static(static,static_cols,scaler)
+    train_ds=ColdStartStationDataset(train_idx,train_idx,CFG.train_start,CFG.train_end,cube,timestamps,static,static_scaled,distance,scaler)
+    val_ds=ColdStartStationDataset(val_idx,train_idx,CFG.train_start,CFG.train_end,cube,timestamps,static,static_scaled,distance,scaler)
+    if any(len(train_idx[train_idx!=target])!=59 for target in train_idx): raise RuntimeError("training donor protocol不是59")
+    if any(len(train_idx)!=60 for _ in val_idx): raise RuntimeError("validation donor protocol不是60")
+
+    model=TCNTargetCrossAttention(static_dim=len(static_cols)).to(device)
+    parameter_count=sum(parameter.numel() for parameter in model.parameters())
+    gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A (CPU training)"
+    print(f"torch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"GPU name: {gpu_name}")
+    print(f"train sample count: {len(train_ds):,}")
+    print(f"validation sample count: {len(val_ds):,}")
+    print(f"model parameters: {parameter_count:,}")
+    print(f"device: {device} | batch size: {CFG.batch_size} | max epochs: {CFG.max_epochs} | patience: {CFG.early_stopping_patience}",flush=True)
+
+    # Mandatory pre-training gate; it does not construct/read an outer dataset.
+    sanity={"train":audit_dataset(train_ds),"validation":audit_dataset(val_ds)}
+    smoke=smoke_forward(model,make_loader(train_ds,False),device)
+    model.zero_grad(set_to_none=True)
+    if sanity["train"]["sampled_donor_counts"]!=[59] or sanity["validation"]["sampled_donor_counts"]!=[60]:
+        raise RuntimeError("sanity donor count未通過")
+    (output_dir/"pretraining_sanity.json").write_text(json.dumps({**sanity,"model":smoke},ensure_ascii=False,indent=2),encoding="utf-8")
+    print("PRE-TRAINING SANITY PASSED",flush=True)
+
+    feature_builder=None
+    if device.type=="cuda":
+        max_time_index=int(max(train_ds.row_times.max(),val_ds.row_times.max()))
+        feature_builder=DeviceFeatureBuilder(train_idx,cube,max_time_index,timestamps,static,static_scaled,distance,scaler,outer,device)
+        train_loader=make_index_loader(train_ds,True); val_loader=make_index_loader(val_ds,False)
+    else:
+        train_loader=make_vectorized_loader(train_ds,train_idx,cube,timestamps,static,static_scaled,distance,scaler,True)
+        val_loader=make_vectorized_loader(val_ds,train_idx,cube,timestamps,static,static_scaled,distance,scaler,False)
+    optimizer=torch.optim.AdamW(model.parameters(),lr=CFG.learning_rate,weight_decay=CFG.weight_decay)
+    grad_scaler=make_grad_scaler(CFG.use_amp and device.type=="cuda")
+    best_macro=math.inf; best_epoch=0; best_metrics=None; epochs_without_improvement=0
+    history=[]; total_start=time.perf_counter(); overall_peak_vram=0.0
+    checkpoint_path=output_dir/"best_checkpoint.pt"
+    prediction_path=output_dir/"validation_predictions.csv"
+    station_metric_path=output_dir/"best_validation_station_metrics.csv"
+    history_path=output_dir/"training_history.csv"
+
+    for epoch in range(1,CFG.max_epochs+1):
+        if device.type=="cuda": torch.cuda.reset_peak_memory_stats(device)
+        epoch_start=time.perf_counter()
+        train_loss=train_epoch(model,train_loader,optimizer,grad_scaler,device,epoch,feature_builder)
+        metrics,station_metrics,predictions=validate_epoch(model,val_loader,device,static,timestamps,epoch,feature_builder)
+        epoch_seconds=time.perf_counter()-epoch_start
+        peak_vram=torch.cuda.max_memory_allocated(device)/1024**2 if device.type=="cuda" else 0.0
+        overall_peak_vram=max(overall_peak_vram,peak_vram)
+        improved=metrics["macro_station_rmse"]<best_macro
+        row={"epoch":epoch,"train_loss":train_loss,**{f"validation_{k}":v for k,v in metrics.items()},"epoch_runtime_seconds":epoch_seconds,"gpu_peak_vram_mb":peak_vram,"is_best":improved}
+        history.append(row); pd.DataFrame(history).to_csv(history_path,index=False,encoding="utf-8-sig")
+        print(
+            f"epoch {epoch}: train_loss={train_loss:.6f} | val MAE={metrics['mae']:.4f} "
+            f"RMSE={metrics['rmse']:.4f} R2={metrics['r2']:.4f} Bias={metrics['bias']:.4f} "
+            f"MacroRMSE={metrics['macro_station_rmse']:.4f} | {epoch_seconds:.1f}s | peak={peak_vram:.1f}MiB",
+            flush=True,
+        )
+        if improved:
+            best_macro=metrics["macro_station_rmse"]; best_epoch=epoch; best_metrics=metrics
+            epochs_without_improvement=0
+            checkpoint={
+                "epoch":epoch,"model_state_dict":cpu_state_dict(model),"optimizer_state_dict":optimizer.state_dict(),
+                "validation_metrics":metrics,"train_indices":train_idx,"validation_indices":val_idx,
+                "outer_index_excluded":outer,"static_columns":static_cols,
+                "scaler":{
+                    "dynamic_mean":scaler.dynamic_mean,"dynamic_std":scaler.dynamic_std,
+                    "static_mean":scaler.static_mean,"static_std":scaler.static_std,"static_median":scaler.static_median,
+                },
+                "config":serializable_config(),"torch_version":torch.__version__,
+            }
+            torch.save(checkpoint,checkpoint_path)
+            station_metrics.to_csv(station_metric_path,index=False,encoding="utf-8-sig")
+            predictions.to_csv(prediction_path,index=False,encoding="utf-8-sig",date_format="%Y-%m-%d %H:%M:%S")
+        else:
+            epochs_without_improvement+=1
+        if epochs_without_improvement>=CFG.early_stopping_patience:
+            print(f"EARLY STOPPING: {CFG.early_stopping_patience} epochs without MacroRMSE improvement",flush=True)
+            break
+
+    total_seconds=time.perf_counter()-total_start
+    summary={
+        "best_epoch":best_epoch,"best_validation_macro_rmse":best_macro,
+        "best_validation_rmse":best_metrics["rmse"],"best_validation_r2":best_metrics["r2"],
+        "best_validation_bias":best_metrics["bias"],"training_time_seconds":total_seconds,
+        "peak_vram_mb":overall_peak_vram,"checkpoint":str(checkpoint_path),
+        "epochs_completed":len(history),"device":str(device),"gpu_name":gpu_name,
+    }
+    (output_dir/"training_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
+    print(json.dumps(summary,ensure_ascii=False,indent=2),flush=True)
+
+
+if __name__=="__main__":
+    main()

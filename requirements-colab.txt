@@ -1,0 +1,3 @@
+# Colab already provides a CUDA-enabled PyTorch build. Do not reinstall torch here.
+numpy>=1.26,<3
+pandas>=2.0,<4
