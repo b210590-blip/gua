@@ -350,10 +350,11 @@ def main() -> None:
     grad_scaler=make_grad_scaler(amp_dtype==torch.float16)
     print(f"AMP dtype: {str(amp_dtype).replace('torch.','') if amp_dtype else 'disabled'} | fused AdamW: {fused_optimizer} | TF32: {CFG.enable_tf32 and device.type=='cuda'}",flush=True)
     best_macro=math.inf; best_epoch=0; best_metrics=None; epochs_without_improvement=0
-    history=[]; total_start=time.perf_counter(); overall_peak_vram=0.0
+    history=[]; all_station_metrics=[]; total_start=time.perf_counter(); overall_peak_vram=0.0
     checkpoint_path=output_dir/"best_checkpoint.pt"
     prediction_path=output_dir/"validation_predictions.csv"
     station_metric_path=output_dir/"best_validation_station_metrics.csv"
+    all_station_metric_path=output_dir/"validation_station_metrics_all_epochs.csv"
     history_path=output_dir/"training_history.csv"
 
     for epoch in range(1,CFG.max_epochs+1):
@@ -391,6 +392,13 @@ def main() -> None:
             predictions.to_csv(prediction_path,index=False,encoding="utf-8-sig",date_format="%Y-%m-%d %H:%M:%S")
         else:
             epochs_without_improvement+=1
+        station_epoch=station_metrics.copy()
+        station_epoch.insert(0,"epoch",epoch)
+        station_epoch["is_new_best"]=improved
+        all_station_metrics.append(station_epoch)
+        station_history=pd.concat(all_station_metrics,ignore_index=True)
+        station_history["is_best"]=station_history["epoch"].eq(best_epoch)
+        station_history.to_csv(all_station_metric_path,index=False,encoding="utf-8-sig")
         if epochs_without_improvement>=CFG.early_stopping_patience:
             print(f"EARLY STOPPING: {CFG.early_stopping_patience} epochs without MacroRMSE improvement",flush=True)
             break
@@ -403,6 +411,7 @@ def main() -> None:
         "peak_vram_mb":overall_peak_vram,"checkpoint":str(checkpoint_path),
         "epochs_completed":len(history),"device":str(device),"gpu_name":gpu_name,
         "runtime_profile":runtime_profile,"fused_adamw":fused_optimizer,
+        "all_epoch_station_metrics":str(all_station_metric_path),
     }
     (output_dir/"training_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
     print(json.dumps(summary,ensure_ascii=False,indent=2),flush=True)
