@@ -64,6 +64,54 @@ def choose_split(clusters: np.ndarray, heldout: int, cfg: Config = CFG):
     return train,val
 
 
+def make_meta_crossfit_folds(clusters: np.ndarray, heldout: int, cfg: Config = CFG):
+    """Create six disjoint 60/12 folds over the 72 known stations.
+
+    Fold 0 is exactly the existing Reduced cluster-aware split.  Its 60
+    training stations are then partitioned into five balanced validation
+    folds.  Consequently every known station is an unseen validation target
+    exactly once, while the outer station is excluded from every fold.
+    """
+    clusters=np.asarray(clusters,dtype=int)
+    known=np.setdiff1d(np.arange(len(clusters),dtype=int),np.array([heldout],dtype=int))
+    base_train,base_validation=choose_split(clusters,heldout,cfg)
+    rng=np.random.default_rng(cfg.seed+20260901)
+    remaining_folds=[[] for _ in range(5)]
+    # Assign each cluster separately, always to a currently smallest fold.
+    # This spreads rare clusters whenever possible and keeps every fold at 12.
+    for cluster in sorted(np.unique(clusters[base_train])):
+        members=base_train[clusters[base_train]==cluster].copy()
+        rng.shuffle(members)
+        cluster_counts=np.zeros(5,dtype=int)
+        for station in members:
+            sizes=np.array([len(x) for x in remaining_folds],dtype=int)
+            candidates=np.flatnonzero(
+                (sizes==sizes.min()) & (cluster_counts==cluster_counts.min())
+            )
+            if candidates.size==0:
+                candidates=np.flatnonzero(sizes==sizes.min())
+            fold=int(candidates[0])
+            remaining_folds[fold].append(int(station))
+            cluster_counts[fold]+=1
+    folds=[]
+    for fold_id,validation in enumerate([base_validation.tolist(),*remaining_folds]):
+        validation=np.asarray(sorted(validation),dtype=int)
+        training=np.setdiff1d(known,validation)
+        if len(training)!=60 or len(validation)!=12:
+            raise AssertionError(
+                f"crossfit fold {fold_id}應為60/12，實際{len(training)}/{len(validation)}"
+            )
+        if heldout in training or heldout in validation:
+            raise AssertionError(f"crossfit fold {fold_id}混入outer target")
+        folds.append((training,validation))
+    validation_union=np.concatenate([validation for _,validation in folds])
+    if len(np.unique(validation_union))!=72 or set(validation_union)!=set(known):
+        raise AssertionError("crossfit validation folds沒有讓72個known stations各出現一次")
+    if not np.array_equal(folds[0][0],base_train) or not np.array_equal(folds[0][1],base_validation):
+        raise AssertionError("crossfit fold 0沒有保留原Reduced 60/12 split")
+    return folds
+
+
 def haversine_matrix(lon,lat):
     lon=np.radians(np.asarray(lon,float)); lat=np.radians(np.asarray(lat,float))
     dlon=lon[:,None]-lon[None,:]; dlat=lat[:,None]-lat[None,:]

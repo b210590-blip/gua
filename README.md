@@ -104,3 +104,34 @@ python evaluate_outer.py
 修正版同時保留原始49維RBF-all方法作失敗baseline，並加入60站train-only PCA、target對固定60 donors的距離／密度摘要、固定k=1/3/5近鄰及cluster-restricted候選。`target_aware_knn_nested_loso`會在每個held-out validation target之外，再用其餘11站做內層LOSO選擇相似度方法，因此連方法選擇也不會看到held-out target的best epoch。
 
 曲線版`target_aware_curve_nested_loso`不再平均epoch編號，而是對每站完整的epoch-wise RMSE regret curve做regularized multi-output ridge預測，再對預測曲線取argmin。表示法與ridge強度同樣由不含held-out target的內層LOSO選擇。混合epoch方法的精確pooled R²使用既有`validation_predictions.csv`中的共同y_true SST與station×epoch RMSE重建，不再拿macro R²冒充overall R²。
+
+## Target-conditioned snapshot ensemble
+
+舊的static-similarity hard epoch方法只保留作失敗baseline，不再作為正式方案。新流程固定排除outer target，對其餘72站建立六個互斥的60-train/12-unseen-validation folds。Fold 0完全等於原本Reduced cluster-aware 60/12 split；六個folds合計讓每個known station恰好當一次unseen validation target。
+
+```python
+import os
+
+os.environ["DL_TCN_DATA_ROOT"] = "/content/dl_tcn_data"
+os.environ["DL_TCN_OUTPUT_ROOT"] = "/content"
+os.environ["DL_TCN_CROSSFIT_ROOT"] = "/content/crossfit_target_conditioned_snapshots"
+os.environ["DL_TCN_MAX_EPOCHS"] = "15"
+os.environ["DL_TCN_BATCH_SIZE"] = "512"
+os.environ["DL_TCN_LEARNING_RATE"] = "5e-4"
+os.environ["DL_TCN_WEIGHT_DECAY"] = "1e-4"
+os.environ["DL_TCN_DROPOUT"] = "0.20"
+
+%cd /content/dl_tcn_cross_attention
+!python train_crossfit_snapshots.py
+!python fit_target_conditioned_snapshot_ensemble.py
+```
+
+訓練可續跑。每個fold完成後會建立`COMPLETE.json`；每個epoch也會保存`last_training_state.pt`。Colab中斷後重新執行同一格，已完成folds會跳過，未完成fold會從最後一個epoch繼續。也可用`DL_TCN_CROSSFIT_FOLDS="0,1"`只跑指定folds。
+
+selector不再預測離散的`argmin(epoch)`，而是用72站OOF error curves直接學習各epoch的連續權重。完成後可執行正式outer ensemble：
+
+```python
+!python evaluate_outer_target_conditioned_ensemble.py
+```
+
+程式會先只用outer static鎖定權重並寫出`LOCKED_WEIGHTS_BEFORE_OUTER_TRUTH.json`，之後才建立outer test dataset和計分，避免用outer PM2.5選checkpoint。
