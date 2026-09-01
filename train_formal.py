@@ -88,16 +88,19 @@ def make_index_loader(source_dataset,shuffle):
 
 
 class DeviceFeatureBuilder:
-    """Construct the reviewed features on CUDA from a small train-period cube."""
+    """Gather reviewed features from compact, once-per-run CUDA tables."""
     def __init__(self,donor_pool,cube,max_time_index,timestamps,static,static_scaled,distance,scaler,outer_index,device):
+        precompute_started=time.perf_counter()
         cube_np=np.array(cube[:max_time_index+1],dtype="float32",copy=True)
         cube_np[:,outer_index,:]=np.nan
-        self.cube=torch.from_numpy(cube_np).to(device)
+        cube_tensor=torch.from_numpy(cube_np).to(device)
+        del cube_np
         donor_pool=np.asarray(donor_pool,dtype="int64")
         self.static_scaled=torch.as_tensor(static_scaled,dtype=torch.float32,device=device)
         self.dynamic_mean=torch.as_tensor(scaler.dynamic_mean,dtype=torch.float32,device=device)
         self.dynamic_std=torch.as_tensor(scaler.dynamic_std,dtype=torch.float32,device=device)
-        self.raw_indices=torch.tensor([CFG.aq_cube_items.index(x) for x in CFG.raw_dynamic_items],dtype=torch.long,device=device)
+        raw_indices=torch.tensor([CFG.aq_cube_items.index(x) for x in CFG.raw_dynamic_items],dtype=torch.long,device=device)
+        self.raw_channel_indices=torch.arange(len(CFG.raw_dynamic_items),dtype=torch.long,device=device)
         self.speed_index=CFG.aq_cube_items.index("WIND_SPEED"); self.direction_index=CFG.aq_cube_items.index("WIND_DIREC")
         self.pm25_index=CFG.aq_cube_items.index("PM2.5"); self.device=device
         lon=static.longitude.to_numpy(float); lat=static.latitude.to_numpy(float)
@@ -105,27 +108,62 @@ class DeviceFeatureBuilder:
         bearings=np.stack([bearing_degrees(lon,lat,lon[target],lat[target]) for target in range(len(static))]).astype("float32")
         max_donors=len(donor_pool); donor_table=np.full((len(static),max_donors),-1,dtype="int64")
         donor_counts=np.zeros(len(static),dtype="int64"); geometry_table=np.zeros((len(static),max_donors,3),dtype="float32")
-        sin_bearing=np.zeros((len(static),max_donors),dtype="float32"); cos_bearing=np.zeros_like(sin_bearing)
-        bearing_table=np.zeros((len(static),max_donors),dtype="float32")
         donor_static_table=np.zeros((len(static),max_donors,static_scaled.shape[1]),dtype="float32")
         for target in range(len(static)):
             donors=donor_pool[donor_pool!=target]; count=len(donors); donor_counts[target]=count; donor_table[target,:count]=donors
             bearing=bearings[target,donors]; sin_b=np.sin(np.deg2rad(bearing)).astype("float32"); cos_b=np.cos(np.deg2rad(bearing)).astype("float32")
-            bearing_table[target,:count]=bearing
-            sin_bearing[target,:count]=sin_b; cos_bearing[target,:count]=cos_b
             geometry_table[target,:count]=np.stack([np.log1p(distance[target,donors]/1000.0),sin_b,cos_b],axis=-1).astype("float32")
             donor_static_table[target,:count]=static_scaled[donors]
         self.donor_table=torch.from_numpy(donor_table).to(device)
         self.donor_counts=torch.from_numpy(donor_counts).to(device)
         self.geometry_table=torch.from_numpy(geometry_table).to(device)
-        self.bearing_table=torch.from_numpy(bearing_table).to(device)
-        self.sin_bearing_table=torch.from_numpy(sin_bearing).to(device)
-        self.cos_bearing_table=torch.from_numpy(cos_bearing).to(device)
         self.donor_static_table=torch.from_numpy(donor_static_table).to(device)
         self.history_offsets=torch.arange(CFG.history_hours,device=device)-CFG.history_hours+1
         self.zero=torch.zeros((),device=device,dtype=torch.float32)
         tf=np.stack([time_features(ts) for ts in timestamps[:max_time_index+1]]).astype("float32")
         self.time_feature_table=torch.from_numpy(tf).to(device)
+
+        # Labels and nine raw channels are target-independent. Normalize once.
+        self.labels=cube_tensor[:,:,self.pm25_index].clone()
+        raw=cube_tensor.index_select(2,raw_indices)
+        self.raw_mask=torch.isfinite(raw)
+        self.raw_values=(raw-self.dynamic_mean[:len(CFG.raw_dynamic_items)])/self.dynamic_std[:len(CFG.raw_dynamic_items)]
+        self.raw_values=torch.where(self.raw_mask,self.raw_values,self.zero)
+        del raw
+
+        # Target-relative wind is pair-specific but fixed for the whole run.
+        # Store hourly pair tables only; 24h sample windows remain on-demand.
+        n_time,n_station,_=cube_tensor.shape
+        self.wind_values=torch.empty((n_time,n_station,n_station,2),dtype=torch.float32,device=device)
+        self.wind_mask=torch.empty((n_time,n_station,n_station,2),dtype=torch.bool,device=device)
+        speed=cube_tensor[:,:,self.speed_index]
+        wfrom=cube_tensor[:,:,self.direction_index]
+        bearing_all=torch.from_numpy(bearings).to(device)
+        wind_mean=self.dynamic_mean[len(CFG.raw_dynamic_items):]
+        wind_std=self.dynamic_std[len(CFG.raw_dynamic_items):]
+        chunk=max(1,int(CFG.gpu_precompute_chunk_hours))
+        for start in range(0,n_time,chunk):
+            stop=min(start+chunk,n_time)
+            sp=speed[start:stop]
+            wd=wfrom[start:stop]
+            valid=torch.isfinite(sp)&torch.isfinite(wd)
+            delta=torch.deg2rad(torch.remainder(wd[:,None,:]+180.0,360.0)-bearing_all[None,:,:])
+            pair=torch.stack([sp[:,None,:]*torch.cos(delta),sp[:,None,:]*torch.sin(delta)],dim=-1)
+            pair=(pair-wind_mean)/wind_std
+            pair_valid=valid[:,None,:,None].expand(-1,n_station,-1,2)
+            self.wind_values[start:stop]=torch.where(pair_valid,pair,self.zero)
+            self.wind_mask[start:stop]=pair_valid
+            del delta,pair,pair_valid
+        del speed,wfrom,bearing_all,cube_tensor
+        if device.type=="cuda": torch.cuda.synchronize(device)
+        self.precompute_seconds=time.perf_counter()-precompute_started
+        self.precomputed_table_mb=(
+            self.raw_values.numel()*self.raw_values.element_size()
+            +self.raw_mask.numel()*self.raw_mask.element_size()
+            +self.wind_values.numel()*self.wind_values.element_size()
+            +self.wind_mask.numel()*self.wind_mask.element_size()
+            +self.labels.numel()*self.labels.element_size()
+        )/1024**2
 
     def __call__(self,index_batch):
         targets=index_batch["target_idx"].to(self.device,non_blocking=True)
@@ -135,19 +173,15 @@ class DeviceFeatureBuilder:
         donor_count=int(counts[0].item()); donors=self.donor_table[targets,:donor_count]
         history=current[:,None]+self.history_offsets[None,:]
         if int(history.min().item())<0: raise RuntimeError("AQ cube起點不足24h history")
-        raw=self.cube[history[:,:,None,None],donors[:,None,:,None],self.raw_indices[None,None,None,:]]
-        speed=self.cube[history[:,:,None],donors[:,None,:],self.speed_index]
-        wfrom=self.cube[history[:,:,None],donors[:,None,:],self.direction_index]
-        bearing=self.bearing_table[targets,:donor_count]
-        delta=torch.deg2rad(torch.remainder(wfrom+180.0,360.0)-bearing[:,None,:])
-        along=speed*torch.cos(delta); cross=speed*torch.sin(delta)
-        values=torch.cat([raw,torch.stack([along,cross],dim=-1)],dim=-1).permute(0,2,1,3).contiguous()
-        mask=torch.isfinite(values).to(torch.float32)
-        values=(values-self.dynamic_mean[None,None,None,:])/self.dynamic_std[None,None,None,:]
-        values=torch.where(mask>0,values,self.zero)
+        raw=self.raw_values[history[:,:,None,None],donors[:,None,:,None],self.raw_channel_indices[None,None,None,:]]
+        raw_mask=self.raw_mask[history[:,:,None,None],donors[:,None,:,None],self.raw_channel_indices[None,None,None,:]]
+        wind=self.wind_values[history[:,:,None],targets[:,None,None],donors[:,None,:]]
+        wind_mask=self.wind_mask[history[:,:,None],targets[:,None,None],donors[:,None,:]]
+        values=torch.cat([raw,wind],dim=-1).permute(0,2,1,3).contiguous()
+        mask=torch.cat([raw_mask,wind_mask],dim=-1).permute(0,2,1,3).to(torch.float32).contiguous()
         all_missing=mask.sum(dim=(2,3))==0
         geometry=self.geometry_table[targets,:donor_count]
-        labels=self.cube[current,targets,self.pm25_index]
+        labels=self.labels[current,targets]
         if not torch.isfinite(labels).all(): raise RuntimeError("index batch包含缺失target label")
         return {
             "values":values,"mask":mask,"donor_static":self.donor_static_table[targets,:donor_count],"geometry":geometry,
@@ -359,6 +393,9 @@ def main() -> None:
     if device.type=="cuda":
         max_time_index=int(max(train_ds.row_times.max(),val_ds.row_times.max()))
         feature_builder=DeviceFeatureBuilder(train_idx,cube,max_time_index,timestamps,static,static_scaled,distance,scaler,outer,device)
+        runtime_profile["feature_precompute_seconds"]=feature_builder.precompute_seconds
+        runtime_profile["precomputed_feature_tables_mb"]=feature_builder.precomputed_table_mb
+        print(f"GPU feature precompute: {feature_builder.precompute_seconds:.1f}s | tables={feature_builder.precomputed_table_mb:.1f}MiB",flush=True)
         train_loader=make_index_loader(train_ds,True); val_loader=make_index_loader(val_ds,False)
     else:
         train_loader=make_vectorized_loader(train_ds,train_idx,cube,timestamps,static,static_scaled,distance,scaler,True)

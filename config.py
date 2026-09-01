@@ -81,6 +81,7 @@ class Config:
     l4_batch_size: int = 512
     l4_num_workers: int = 4
     smoke_batch_size: int = 8
+    gpu_precompute_chunk_hours: int = 512
 
     @property
     def dynamic_items(self) -> tuple[str, ...]:

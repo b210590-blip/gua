@@ -39,6 +39,8 @@
 
 目前正式config：learning rate `5e-4`、station-balanced MSE、max epochs `15`、patience `5`。station-balanced權重依60個training stations各自可用樣本數計算，使每站對期望loss的貢獻相同。Colab L4會自動使用batch size `512`、4個輕量index workers、BF16 AMP、TF32與fused AdamW；其他CUDA GPU會依VRAM保守選擇batch。資料、split、特徵與模型架構不變。
 
+CUDA正式訓練會在每次run開始時，一次性預計算9個raw channels的mask/標準化值，以及所有target-donor的WIND_ALONG/WIND_CROSS；每個epoch只擷取24小時窗口，不重算三角函數，也不預展開全年sample tensor。啟動時會印出預計算秒數與table VRAM。
+
 如L4仍發生OOM，不需改程式，可在正式訓練前覆寫：
 
 ```python
