@@ -152,9 +152,9 @@ OOF評估時每次完整排除被預測站的類別與epoch曲線：分類器只
 
 ## 透明static規則（不用分類器）
 
-`analyze_interpretable_epoch_rules.py`不使用CART、Extra Trees或其他分類模型。規則只計算兩個可直接閱讀的分數：近距離森林／NDVI的平均百分位，以及近距離交通／商業／建成／住宅的平均百分位。兩者相減後依參考站分布粗分三個static profile groups。
+`analyze_interpretable_epoch_rules.py`不使用CART、Extra Trees或其他分類模型，只保留五項最有解釋力且較不重複的static features。固定門檻為：0–1 km森林比例≥1.43%、1–5 km森林比例≥12.53%、0–1 km交通比例≤17.89%、0–1 km商業比例≤2.39%、1–5 km建成比例≤17.60%。符合一項得1分；4–5分為early profile、2–3分為middle profile、0–1分為late profile。
 
-六個fold是六次獨立訓練，因此raw epoch不直接跨fold平均。逐站檢查時，先以同fold另外11個validation站取得該次訓練的reference epoch，再將每站最佳epoch轉成fold-relative offset。被檢查站完全不參與自己的百分位、門檻、fold reference或offset校準；同fold其他參考站的reference也會額外排除該target，因此由10站而非偷偷包含target的11站計算。目標被分組後，程式比較「同組station regret最低的offset」與「同組最佳offset中位數」，最後把offset加回該次訓練的reference epoch。輸出會逐站列出fold、reference epoch、真實／預測offset、static分數、判斷依據與RMSE regret。規則特徵源自看過72站後的development分析，因此不能冒充完全獨立outer驗證。
+六個fold是六次獨立訓練，因此raw epoch不直接跨fold平均。逐站檢查時，先以同fold另外11個validation站取得該次訓練的reference epoch，再將每站最佳epoch轉成fold-relative offset。被檢查站完全不參與自己的門檻判定以外之校準、fold reference或offset計算；同fold其他參考站的reference也會額外排除該target，因此由10站計算。目標依五項門檻分組後，程式比較同組station regret最低offset與同組最佳offset中位數，最後把offset加回該次訓練的reference epoch。輸出逐站列出五項數值、是否通過、總分、profile、reference epoch、真實／預測offset及RMSE regret。
 
 ```python
 %env DL_TCN_CROSSFIT_ROOT=/content/crossfit_target_conditioned_snapshots

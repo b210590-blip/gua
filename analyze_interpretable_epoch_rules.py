@@ -11,22 +11,14 @@ from config import CFG
 from data_pipeline import load_static
 
 
-GREEN_FEATURES = (
-    "forest_ratio_ring_0_1km",
-    "forest_ratio_ring_1_5km",
-    "forest_ratio_ring_5_10km",
-    "ndvi_mean_1km",
-    "ndvi_mean_3km",
-)
-URBAN_FEATURES = (
-    "transportation_ratio_ring_0_1km",
-    "commercial_ratio_ring_0_1km",
-    "built_up_ratio_ring_1_5km",
-    "residential_ratio_ring_0_1km",
-)
-RULE_FEATURES = GREEN_FEATURES + URBAN_FEATURES
-LOWER_QUANTILE = 0.35
-UPPER_QUANTILE = 0.70
+RULE_THRESHOLDS = {
+    "forest_ratio_ring_0_1km": (">=", 0.0142865),
+    "forest_ratio_ring_1_5km": (">=", 0.1253290),
+    "transportation_ratio_ring_0_1km": ("<=", 0.1789325),
+    "commercial_ratio_ring_0_1km": ("<=", 0.0239320),
+    "built_up_ratio_ring_1_5km": ("<=", 0.1760480),
+}
+RULE_FEATURES = tuple(RULE_THRESHOLDS)
 
 
 def epoch_regime(epoch: int) -> str:
@@ -85,60 +77,24 @@ def build_oracle(history: pd.DataFrame) -> pd.DataFrame:
     return oracle
 
 
-def empirical_percentile(reference: np.ndarray, values: np.ndarray) -> np.ndarray:
-    """Mid-rank empirical CDF of values relative to reference, NaN-safe."""
-    reference = np.asarray(reference, dtype="float64")
-    values = np.asarray(values, dtype="float64")
-    finite = np.sort(reference[np.isfinite(reference)])
-    if not len(finite):
-        return np.full(values.shape, 0.5, dtype="float64")
-    left = np.searchsorted(finite, values, side="left")
-    right = np.searchsorted(finite, values, side="right")
-    result = (left + right) / (2.0 * len(finite))
-    result[~np.isfinite(values)] = 0.5
-    return result
-
-
-def score_against_reference(
-    reference: pd.DataFrame,
-    target: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.Series]:
-    percentiles = pd.DataFrame(index=target.index)
-    for feature in RULE_FEATURES:
-        percentiles[f"pct_{feature}"] = empirical_percentile(
-            pd.to_numeric(reference[feature], errors="coerce").to_numpy(),
-            pd.to_numeric(target[feature], errors="coerce").to_numpy(),
-        )
-    green_columns = [f"pct_{feature}" for feature in GREEN_FEATURES]
-    urban_columns = [f"pct_{feature}" for feature in URBAN_FEATURES]
-    percentiles["green_score"] = percentiles[green_columns].mean(axis=1)
-    percentiles["urban_score"] = percentiles[urban_columns].mean(axis=1)
-    percentiles["green_minus_urban"] = (
-        percentiles.green_score - percentiles.urban_score
-    )
-
-    reference_scores = pd.DataFrame(index=reference.index)
-    for feature in RULE_FEATURES:
-        reference_scores[f"pct_{feature}"] = empirical_percentile(
-            pd.to_numeric(reference[feature], errors="coerce").to_numpy(),
-            pd.to_numeric(reference[feature], errors="coerce").to_numpy(),
-        )
-    reference_scores["green_score"] = reference_scores[
-        [f"pct_{feature}" for feature in GREEN_FEATURES]
-    ].mean(axis=1)
-    reference_scores["urban_score"] = reference_scores[
-        [f"pct_{feature}" for feature in URBAN_FEATURES]
-    ].mean(axis=1)
-    contrast = reference_scores.green_score - reference_scores.urban_score
-    return percentiles, contrast
-
-
-def classify(contrast: float, lower: float, upper: float) -> str:
-    if contrast >= upper:
-        return "early"
-    if contrast <= lower:
-        return "late"
-    return "middle"
+def classify_static_row(row: pd.Series) -> tuple[str, int, dict[str, bool]]:
+    passed = {}
+    for feature, (operator, threshold) in RULE_THRESHOLDS.items():
+        value = float(pd.to_numeric(row[feature], errors="coerce"))
+        if not np.isfinite(value):
+            passed[feature] = False
+        elif operator == ">=":
+            passed[feature] = value >= threshold
+        else:
+            passed[feature] = value <= threshold
+    score = int(sum(passed.values()))
+    if score >= 4:
+        profile = "early"
+    elif score <= 1:
+        profile = "late"
+    else:
+        profile = "middle"
+    return profile, score, passed
 
 
 def fold_reference_epoch_excluding_station(
@@ -208,20 +164,14 @@ def choose_group_offsets(
     return regret_offset, median_offset, int(len(members))
 
 
-def evidence_text(percentile_row: pd.Series) -> str:
-    evidence = []
-    for feature in GREEN_FEATURES:
-        value = float(percentile_row[f"pct_{feature}"])
-        evidence.append((abs(value - 0.5), value - 0.5, feature, value))
-    for feature in URBAN_FEATURES:
-        value = float(percentile_row[f"pct_{feature}"])
-        # High urban values support late; use negative sign for the early axis.
-        evidence.append((abs(value - 0.5), 0.5 - value, feature, value))
-    strongest = sorted(evidence, reverse=True)[:4]
+def evidence_text(row: pd.Series, passed: dict[str, bool]) -> str:
     parts = []
-    for _, signed, feature, value in strongest:
-        direction = "supports early" if signed > 0 else "supports late"
-        parts.append(f"{feature} pct={value:.2f} {direction}")
+    for feature, (operator, threshold) in RULE_THRESHOLDS.items():
+        value = float(pd.to_numeric(row[feature], errors="coerce"))
+        status = "pass" if passed[feature] else "fail"
+        parts.append(
+            f"{feature}={value:.6f} {operator} {threshold:.6f}: {status}"
+        )
     return "; ".join(parts)
 
 
@@ -285,32 +235,6 @@ def performance_summary(
     return result
 
 
-def static_association_table(
-    static: pd.DataFrame,
-    static_cols: list[str],
-    oracle: pd.DataFrame,
-) -> pd.DataFrame:
-    rows = []
-    epoch = oracle.set_index("station_index").true_best_epoch
-    regime = oracle.set_index("station_index").true_regime
-    for feature in static_cols:
-        values = pd.to_numeric(static.loc[oracle.station_index, feature], errors="coerce")
-        values.index = oracle.station_index
-        ranked_correlation = values.rank().corr(epoch.rank())
-        row = {
-            "feature": feature,
-            "spearman_vs_best_epoch": ranked_correlation,
-        }
-        for label in ("early", "middle", "late"):
-            selected = values[regime == label]
-            row[f"{label}_mean"] = selected.mean()
-            row[f"{label}_median"] = selected.median()
-        rows.append(row)
-    result = pd.DataFrame(rows)
-    result["absolute_spearman"] = result.spearman_vs_best_epoch.abs()
-    return result.sort_values("absolute_spearman", ascending=False)
-
-
 def main() -> None:
     if CFG.max_epochs != 15:
         raise RuntimeError("fold-relative規則需要完整epoch 1..15，請設定DL_TCN_MAX_EPOCHS=15")
@@ -330,7 +254,7 @@ def main() -> None:
 
     history = load_history(root)
     oracle = build_oracle(history)
-    static, _, static_cols = load_static()
+    static, _, _ = load_static()
     missing_features = set(RULE_FEATURES) - set(static.columns)
     if missing_features:
         raise RuntimeError(f"static缺少規則特徵: {sorted(missing_features)}")
@@ -341,17 +265,12 @@ def main() -> None:
     print("Transparent static rule LOSO: 0/72", flush=True)
     for position, station in enumerate(station_ids):
         reference_ids = np.delete(station_ids, position)
-        reference = static.loc[reference_ids, list(RULE_FEATURES)]
-        target = static.loc[[station], list(RULE_FEATURES)]
-        target_scores, reference_contrast = score_against_reference(reference, target)
-        lower = float(reference_contrast.quantile(LOWER_QUANTILE))
-        upper = float(reference_contrast.quantile(UPPER_QUANTILE))
-        score_row = target_scores.iloc[0]
-        predicted_regime = classify(
-            float(score_row.green_minus_urban), lower, upper
+        target_row = static.loc[int(station)]
+        predicted_regime, threshold_score, target_passed = classify_static_row(
+            target_row
         )
         reference_groups = np.asarray(
-            [classify(float(value), lower, upper) for value in reference_contrast],
+            [classify_static_row(static.loc[int(member)])[0] for member in reference_ids],
             dtype=str,
         )
         # Strict outer LOSO: target station is excluded not only from its own
@@ -393,16 +312,17 @@ def main() -> None:
             "median_selected_epoch": median_epoch,
             "median_selected_offset": median_offset,
             "group_reference_stations": group_reference_stations,
-            "green_score": float(score_row.green_score),
-            "urban_score": float(score_row.urban_score),
-            "green_minus_urban": float(score_row.green_minus_urban),
-            "loso_lower_threshold": lower,
-            "loso_upper_threshold": upper,
-            "evidence": evidence_text(score_row),
+            "threshold_score": threshold_score,
+            "evidence": evidence_text(target_row, target_passed),
             **{
-                column: float(score_row[column])
-                for column in score_row.index
-                if column.startswith("pct_")
+                f"value_{feature}": float(
+                    pd.to_numeric(target_row[feature], errors="coerce")
+                )
+                for feature in RULE_FEATURES
+            },
+            **{
+                f"pass_{feature}": bool(target_passed[feature])
+                for feature in RULE_FEATURES
             },
         }
         station_rows.append(common)
@@ -494,7 +414,6 @@ def main() -> None:
         dropna=False,
     ).reindex(index=["early", "middle", "late"], columns=["early", "middle", "late"], fill_value=0)
 
-    association = static_association_table(static, static_cols, oracle)
     station_table.to_csv(
         output / "transparent_rule_station_table.csv",
         index=False,
@@ -519,8 +438,17 @@ def main() -> None:
         output / "transparent_rule_confusion_matrix.csv",
         encoding="utf-8-sig",
     )
-    association.to_csv(
-        output / "static_vs_best_epoch_association.csv",
+    pd.DataFrame(
+        [
+            {
+                "feature": feature,
+                "operator": operator,
+                "threshold": threshold,
+            }
+            for feature, (operator, threshold) in RULE_THRESHOLDS.items()
+        ]
+    ).to_csv(
+        output / "selected_static_thresholds.csv",
         index=False,
         encoding="utf-8-sig",
     )
@@ -536,13 +464,14 @@ def main() -> None:
         encoding="utf-8-sig",
     )
     definition = {
-        "green_features": list(GREEN_FEATURES),
-        "urban_features": list(URBAN_FEATURES),
-        "score": "mean(green empirical percentiles) - mean(urban empirical percentiles)",
-        "thresholds": {
-            "late": f"score <= reference {LOWER_QUANTILE:.0%} quantile",
-            "middle": "between thresholds",
-            "early": f"score >= reference {UPPER_QUANTILE:.0%} quantile",
+        "fixed_thresholds": {
+            feature: {"operator": operator, "threshold": threshold}
+            for feature, (operator, threshold) in RULE_THRESHOLDS.items()
+        },
+        "profile_rule": {
+            "early": "4-5 passed thresholds",
+            "middle": "2-3 passed thresholds",
+            "late": "0-1 passed thresholds",
         },
         "epoch_calibration": {
             "fold_reference": (
@@ -561,10 +490,6 @@ def main() -> None:
         "evaluation": (
             "Each station is excluded from static percentiles, thresholds, its fold "
             "reference epoch, and offset calibration until final scoring."
-        ),
-        "important_limitation": (
-            "The nine rule features were chosen after inspecting all 72 development stations. "
-            "This is an interpretable development analysis, not a fully independent outer evaluation."
         ),
         "uses_classifier": False,
         "tcn_retraining": False,
