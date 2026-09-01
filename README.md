@@ -101,4 +101,6 @@ python evaluate_outer.py
 
 程式輸出station×epoch矩陣、similarity矩陣、PCA／heatmap、global／macro／target-aware／oracle逐站表現，以及明確列出12站樣本量與目前只保存best checkpoint的限制。
 
-修正版同時保留原始49維RBF-all方法作失敗baseline，並加入60站train-only PCA、target對固定60 donors的距離／密度摘要、固定k=1/3/5近鄰及cluster-restricted候選。主要`target_aware_nested_loso`結果會在每個held-out validation target之外，再用其餘11站做內層LOSO選擇相似度方法，因此連方法選擇也不會看到held-out target的best epoch。
+修正版同時保留原始49維RBF-all方法作失敗baseline，並加入60站train-only PCA、target對固定60 donors的距離／密度摘要、固定k=1/3/5近鄰及cluster-restricted候選。`target_aware_knn_nested_loso`會在每個held-out validation target之外，再用其餘11站做內層LOSO選擇相似度方法，因此連方法選擇也不會看到held-out target的best epoch。
+
+曲線版`target_aware_curve_nested_loso`不再平均epoch編號，而是對每站完整的epoch-wise RMSE regret curve做regularized multi-output ridge預測，再對預測曲線取argmin。表示法與ridge強度同樣由不含held-out target的內層LOSO選擇。混合epoch方法的精確pooled R²使用既有`validation_predictions.csv`中的共同y_true SST與station×epoch RMSE重建，不再拿macro R²冒充overall R²。

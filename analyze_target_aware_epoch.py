@@ -31,6 +31,7 @@ def analysis_paths():
     required={
         "station_history":source/"validation_station_metrics_all_epochs.csv",
         "training_history":source/"training_history.csv",
+        "validation_predictions":source/"validation_predictions.csv",
         "checkpoint":source/"best_checkpoint.pt",
     }
     missing=[str(path) for path in required.values() if not path.is_file()]
@@ -207,6 +208,63 @@ def nested_loso_predictions(specs,representations,best_values,clusters,available
     return predictions,chosen,pd.DataFrame(score_rows)
 
 
+def ridge_multioutput_predict(train_x,train_y,test_x,alpha):
+    x=np.column_stack([np.ones(len(train_x)),train_x])
+    test=np.concatenate([[1.0],np.asarray(test_x,dtype="float64")])
+    penalty=np.eye(x.shape[1],dtype="float64")*float(alpha); penalty[0,0]=0.0
+    coefficients=np.linalg.solve(x.T@x+penalty,x.T@train_y)
+    return test@coefficients
+
+
+def curve_candidate_specs():
+    specs=[{"name":"mean_regret_curve","representation":None,"alpha":None}]
+    for representation in ("pca5","geometry","hybrid"):
+        for alpha in (0.1,1.0,10.0,100.0):
+            specs.append({"name":f"ridge_curve_{representation}_a{alpha:g}","representation":representation,"alpha":alpha})
+    return specs
+
+
+def predict_regret_curve(spec,representations,regret_curves,target_pos,reference_positions):
+    refs=np.asarray(reference_positions,dtype=int)
+    if spec["representation"] is None:
+        curve=regret_curves[refs].mean(axis=0)
+    else:
+        values=representations[spec["representation"]]
+        curve=ridge_multioutput_predict(values[refs],regret_curves[refs],values[target_pos],spec["alpha"])
+    return np.asarray(curve,dtype="float64")
+
+
+def nested_curve_loso_predictions(specs,representations,rmse_curves,available_epochs,station_indices):
+    regret_curves=rmse_curves-rmse_curves.min(axis=1,keepdims=True)
+    predictions={}; chosen={}; predicted_curves={}; score_rows=[]
+    n=len(station_indices)
+    for heldout in range(n):
+        inner_positions=[position for position in range(n) if position!=heldout]
+        scored=[]
+        for spec in specs:
+            regrets=[]; epoch_errors=[]
+            for inner_target in inner_positions:
+                refs=[position for position in inner_positions if position!=inner_target]
+                curve=predict_regret_curve(spec,representations,regret_curves,inner_target,refs)
+                predicted_position=int(np.argmin(curve))
+                oracle_position=int(np.argmin(rmse_curves[inner_target]))
+                regrets.append(float(rmse_curves[inner_target,predicted_position]-rmse_curves[inner_target,oracle_position]))
+                epoch_errors.append(abs(available_epochs[predicted_position]-available_epochs[oracle_position]))
+            score=(float(np.mean(regrets)),float(np.mean(epoch_errors)),spec["name"])
+            scored.append((score,spec))
+            score_rows.append({
+                "heldout_station_index":int(station_indices[heldout]),"curve_candidate":spec["name"],
+                "inner_mean_rmse_regret":score[0],"inner_mean_absolute_epoch_error":score[1],
+            })
+        _,selected_spec=min(scored,key=lambda item:item[0])
+        curve=predict_regret_curve(selected_spec,representations,regret_curves,heldout,inner_positions)
+        predicted_position=int(np.argmin(curve))
+        predictions[heldout]=int(available_epochs[predicted_position])
+        chosen[heldout]=selected_spec["name"]
+        predicted_curves[heldout]=curve
+    return predictions,chosen,predicted_curves,pd.DataFrame(score_rows)
+
+
 def similarity_epoch_diagnostics(representations,best_values):
     rows=[]; upper=np.triu_indices(len(best_values),1)
     epoch_gap=np.abs(best_values[:,None]-best_values[None,:])[upper]
@@ -231,6 +289,20 @@ def plateau_diagnostics(station_history):
             "epochs_within_1pct":int(len(near)),
         })
     return pd.DataFrame(rows)
+
+
+def pooled_truth_sst(prediction_path,station_history):
+    predictions=pd.read_csv(prediction_path,encoding="utf-8-sig")
+    if "y_true" not in predictions.columns:
+        raise RuntimeError("validation_predictions.csv缺少y_true")
+    truth=pd.to_numeric(predictions.y_true,errors="coerce").to_numpy("float64")
+    if not np.isfinite(truth).all(): raise RuntimeError("validation y_true含NaN/Inf")
+    expected=int(station_history.groupby("station_index").n.first().sum())
+    if len(truth)!=expected:
+        raise RuntimeError(f"validation_predictions rows與station n不一致: {len(truth)} != {expected}")
+    sst=float(np.sum(np.square(truth-truth.mean())))
+    if sst<=0: raise RuntimeError("validation pooled truth SST不是正值")
+    return sst
 
 
 def nearest_available_epoch(value,available):
@@ -268,15 +340,17 @@ def select_station_rows(station_history,epochs_by_station,method,true_best):
     return pd.DataFrame(rows)
 
 
-def summarize_performance(selected):
+def summarize_performance(selected,truth_sst):
     rows=[]
     for method,frame in selected.groupby("method",sort=False):
         n=frame.n.to_numpy(float); total=n.sum()
+        pooled_sse=float(np.sum(n*np.square(frame.rmse)))
         rows.append({
             "method":method,
             "stations":int(len(frame)),
             "macro_rmse":float(frame.rmse.mean()),
-            "pooled_rmse_from_station_sse":float(np.sqrt(np.sum(n*np.square(frame.rmse))/total)),
+            "pooled_rmse_from_station_sse":float(np.sqrt(pooled_sse/total)),
+            "pooled_r2_exact":float(1.0-pooled_sse/truth_sst),
             "macro_mae":float(frame.mae.mean()),
             "sample_weighted_mae":float(np.sum(n*frame.mae)/total),
             "macro_r2":float(frame.r2.mean()),
@@ -397,6 +471,15 @@ def main():
     )
     nested_predicted={int(validation_indices[position]):epoch for position,epoch in nested_positions.items()}
     nested_method_by_station={int(validation_indices[position]):name for position,name in nested_methods.items()}
+
+    rmse_curves=(station_history.pivot(index="station_index",columns="epoch",values="rmse")
+                 .reindex(index=validation_indices,columns=available_epochs).to_numpy("float64"))
+    if not np.isfinite(rmse_curves).all(): raise RuntimeError("station RMSE curve matrix含NaN/Inf")
+    curve_positions,curve_methods,predicted_curves,curve_inner_scores=nested_curve_loso_predictions(
+        curve_candidate_specs(),representations,rmse_curves,available_epochs,validation_indices
+    )
+    curve_predicted={int(validation_indices[position]):epoch for position,epoch in curve_positions.items()}
+    curve_method_by_station={int(validation_indices[position]):name for position,name in curve_methods.items()}
     global_selection={int(station):global_epoch for station in validation_indices}
     macro_selection={int(station):macro_epoch for station in validation_indices}
     oracle_selection={int(station):int(true_best.loc[int(station)]) for station in validation_indices}
@@ -406,18 +489,22 @@ def main():
         select_station_rows(station_history,macro_selection,"macro_station_rmse",true_best),
         select_station_rows(station_history,original_predicted,"target_aware_static_similarity_loso",true_best),
         *candidate_selected_frames,
-        select_station_rows(station_history,nested_predicted,"target_aware_nested_loso",true_best),
+        select_station_rows(station_history,nested_predicted,"target_aware_knn_nested_loso",true_best),
+        select_station_rows(station_history,curve_predicted,"target_aware_curve_nested_loso",true_best),
         select_station_rows(station_history,oracle_selection,"station_oracle",true_best),
     ],ignore_index=True)
-    performance=summarize_performance(selected)
+    truth_sst=pooled_truth_sst(paths["validation_predictions"],station_history)
+    performance=summarize_performance(selected,truth_sst)
 
     comparison=best_rows[["station_index","siteid","sitename"]].copy()
     comparison["true_best_epoch"]=comparison.station_index.map(true_best)
     comparison["global_epoch"]=global_epoch
     comparison["macro_epoch"]=macro_epoch
     comparison["original_static49_predicted_epoch"]=comparison.station_index.map(original_predicted)
-    comparison["predicted_epoch"]=comparison.station_index.map(nested_predicted)
-    comparison["selected_similarity_method"]=comparison.station_index.map(nested_method_by_station)
+    comparison["knn_predicted_epoch"]=comparison.station_index.map(nested_predicted)
+    comparison["selected_knn_method"]=comparison.station_index.map(nested_method_by_station)
+    comparison["predicted_epoch"]=comparison.station_index.map(curve_predicted)
+    comparison["selected_curve_model"]=comparison.station_index.map(curve_method_by_station)
     comparison["epoch_error"]=comparison.predicted_epoch-comparison.true_best_epoch
     comparison["absolute_epoch_error"]=comparison.epoch_error.abs()
     comparison["global_absolute_epoch_error"]=(comparison.global_epoch-comparison.true_best_epoch).abs()
@@ -432,12 +519,23 @@ def main():
     performance.to_csv(output/"epoch_selection_performance_summary.csv",index=False,encoding="utf-8-sig")
     focused_methods=[
         "global_validation_rmse","macro_station_rmse","target_aware_static_similarity_loso",
-        "target_aware_nested_loso","station_oracle",
+        "target_aware_knn_nested_loso","target_aware_curve_nested_loso","station_oracle",
     ]
     performance[performance.method.isin(focused_methods)].to_csv(
         output/"primary_performance_comparison.csv",index=False,encoding="utf-8-sig"
     )
     inner_scores.to_csv(output/"nested_loso_inner_method_scores.csv",index=False,encoding="utf-8-sig")
+    curve_inner_scores.to_csv(output/"curve_nested_loso_inner_scores.csv",index=False,encoding="utf-8-sig")
+    curve_rows=[]
+    for position,curve in predicted_curves.items():
+        station=int(validation_indices[position])
+        for epoch,value in zip(available_epochs,curve):
+            curve_rows.append({
+                "station_index":station,"siteid":str(static.loc[station,"siteid"]),
+                "sitename":str(static.loc[station,"sitename"]),"epoch":int(epoch),
+                "predicted_rmse_regret":float(value),"actual_rmse":float(rmse_curves[position,available_epochs.index(epoch)]),
+            })
+    pd.DataFrame(curve_rows).to_csv(output/"predicted_rmse_regret_curves.csv",index=False,encoding="utf-8-sig")
     plateau=plateau_diagnostics(station_history)
     plateau.to_csv(output/"station_best_epoch_plateau_diagnostics.csv",index=False,encoding="utf-8-sig")
     distance_diagnostics=similarity_epoch_diagnostics(representations,best_values)
@@ -455,7 +553,8 @@ def main():
 
     perf=performance.set_index("method")
     original_target=perf.loc["target_aware_static_similarity_loso"]
-    target=perf.loc["target_aware_nested_loso"]
+    knn_target=perf.loc["target_aware_knn_nested_loso"]
+    target=perf.loc["target_aware_curve_nested_loso"]
     global_result=perf.loc["global_validation_rmse"]
     macro_result=perf.loc["macro_station_rmse"]
     original_weights=similarity.copy(); np.fill_diagonal(original_weights,0.0)
@@ -475,6 +574,11 @@ def main():
             str(key):int(value) for key,value in pd.Series(nested_method_by_station).value_counts().items()
         },
         "original_target_aware_macro_rmse_change_vs_global":float(original_target.macro_rmse-global_result.macro_rmse),
+        "knn_nested_macro_rmse_change_vs_global":float(knn_target.macro_rmse-global_result.macro_rmse),
+        "curve_nested_unique_predicted_epochs":sorted(set(curve_predicted.values())),
+        "curve_nested_selected_model_counts":{
+            str(key):int(value) for key,value in pd.Series(curve_method_by_station).value_counts().items()
+        },
         "target_aware_macro_rmse_change_vs_global":float(target.macro_rmse-global_result.macro_rmse),
         "target_aware_macro_rmse_change_vs_macro":float(target.macro_rmse-macro_result.macro_rmse),
         "target_aware_mae_epoch_error_change_vs_global":float(target.mean_absolute_epoch_error-global_result.mean_absolute_epoch_error),
@@ -487,7 +591,7 @@ def main():
         "important_limitations":[
             "Only 12 validation pseudo-targets provide unseen-station epoch labels.",
             "Nested LOSO selects the similarity method without using the held-out pseudo-target label, but its inner folds contain only 10 epoch-labeled stations.",
-            "Exact pooled R2 for heterogeneous selected epochs cannot be reconstructed from station metrics alone; comparisons report macro and sample-weighted station R2.",
+            "Exact pooled R2 is reconstructed from the saved common validation y_true SST and each selected station-epoch SSE.",
             "Current trainer stores only the best checkpoint, so this analysis validates selection retrospectively from epoch-wise metrics; deployment requires saving candidate epoch checkpoints.",
         ],
     }
