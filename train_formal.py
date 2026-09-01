@@ -201,7 +201,21 @@ def regression_metrics(y_true: np.ndarray,y_pred: np.ndarray) -> dict[str,float]
     return {"mae":mae,"rmse":rmse,"r2":r2,"bias":bias}
 
 
-def train_epoch(model,loader,optimizer,grad_scaler,device,epoch: int,feature_builder=None) -> float:
+def make_station_sample_weights(dataset,station_count: int,device: torch.device) -> torch.Tensor:
+    """Weights make the expected epoch objective the mean of station MSEs."""
+    counts=np.bincount(np.asarray(dataset.row_targets,dtype="int64"),minlength=station_count)
+    active=np.flatnonzero(counts>0)
+    if active.size==0:
+        raise RuntimeError("training dataset沒有任何target samples")
+    weights=np.zeros(station_count,dtype="float32")
+    weights[active]=len(dataset)/(active.size*counts[active])
+    sample_mean=float(weights[np.asarray(dataset.row_targets,dtype="int64")].mean())
+    if not np.isclose(sample_mean,1.0,rtol=1e-6,atol=1e-6):
+        raise RuntimeError(f"station-balanced weights未正規化: mean={sample_mean}")
+    return torch.as_tensor(weights,dtype=torch.float32,device=device)
+
+
+def train_epoch(model,loader,optimizer,grad_scaler,device,epoch: int,feature_builder=None,station_sample_weights=None) -> float:
     model.train(); amp_dtype=amp_dtype_for(device); amp_enabled=amp_dtype is not None
     loss_sum=0.0; sample_count=0; started=time.perf_counter()
     for batch_number,batch in enumerate(loader,start=1):
@@ -215,7 +229,11 @@ def train_epoch(model,loader,optimizer,grad_scaler,device,epoch: int,feature_bui
                 batch["values"],batch["mask"],batch["donor_static"],batch["geometry"],
                 batch["donor_padding_mask"],batch["target_static"],batch["time_features"],
             )
-            loss=torch.nn.functional.mse_loss(pred,batch["label"])
+            squared_error=torch.square(pred-batch["label"])
+            if station_sample_weights is None:
+                raise RuntimeError("station-balanced loss缺少training station weights")
+            sample_weights=station_sample_weights[batch["target_idx"]]
+            loss=torch.mean(squared_error*sample_weights)
         if not torch.isfinite(loss):
             raise RuntimeError(f"epoch {epoch} batch {batch_number}: loss非finite")
         grad_scaler.scale(loss).backward()
@@ -349,6 +367,8 @@ def main() -> None:
     amp_dtype=amp_dtype_for(device)
     grad_scaler=make_grad_scaler(amp_dtype==torch.float16)
     print(f"AMP dtype: {str(amp_dtype).replace('torch.','') if amp_dtype else 'disabled'} | fused AdamW: {fused_optimizer} | TF32: {CFG.enable_tf32 and device.type=='cuda'}",flush=True)
+    station_sample_weights=make_station_sample_weights(train_ds,len(static),device)
+    print(f"loss: {CFG.loss_name} | balanced training stations: {(station_sample_weights>0).sum().item()}",flush=True)
     best_macro=math.inf; best_epoch=0; best_metrics=None; epochs_without_improvement=0
     history=[]; all_station_metrics=[]; total_start=time.perf_counter(); overall_peak_vram=0.0
     checkpoint_path=output_dir/"best_checkpoint.pt"
@@ -360,7 +380,7 @@ def main() -> None:
     for epoch in range(1,CFG.max_epochs+1):
         if device.type=="cuda": torch.cuda.reset_peak_memory_stats(device)
         epoch_start=time.perf_counter()
-        train_loss=train_epoch(model,train_loader,optimizer,grad_scaler,device,epoch,feature_builder)
+        train_loss=train_epoch(model,train_loader,optimizer,grad_scaler,device,epoch,feature_builder,station_sample_weights)
         metrics,station_metrics,predictions=validate_epoch(model,val_loader,device,static,timestamps,epoch,feature_builder)
         epoch_seconds=time.perf_counter()-epoch_start
         peak_vram=torch.cuda.max_memory_allocated(device)/1024**2 if device.type=="cuda" else 0.0

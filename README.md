@@ -37,7 +37,7 @@
 !python train_formal.py
 ```
 
-目前正式config：learning rate `5e-4`、max epochs `15`、patience `7`。Colab L4會自動使用batch size `512`、4個輕量index workers、BF16 AMP、TF32與fused AdamW；其他CUDA GPU會依VRAM保守選擇batch。這些調整不改資料、split、特徵、模型架構或loss。
+目前正式config：learning rate `5e-4`、station-balanced MSE、max epochs `15`、patience `5`。station-balanced權重依60個training stations各自可用樣本數計算，使每站對期望loss的貢獻相同。Colab L4會自動使用batch size `512`、4個輕量index workers、BF16 AMP、TF32與fused AdamW；其他CUDA GPU會依VRAM保守選擇batch。資料、split、特徵與模型架構不變。
 
 如L4仍發生OOM，不需改程式，可在正式訓練前覆寫：
 
@@ -51,7 +51,7 @@
 %env DL_TCN_LEARNING_RATE=5e-4
 %env DL_TCN_WEIGHT_DECAY=1e-4
 %env DL_TCN_MAX_EPOCHS=15
-%env DL_TCN_PATIENCE=7
+%env DL_TCN_PATIENCE=5
 ```
 
 ## 建議將輸出寫入Google Drive
@@ -73,7 +73,7 @@ AQ memory-map cache預設留在`/content/dl_tcn_work`，避免將頻繁cache I/O
 
 ## 正式輸出
 
-輸出資料夾為`DL_TCN_CA_v1_formal_lr5e-4_output`，包含：
+輸出資料夾為`DL_TCN_CA_v1_formal_lr5e-4_station_balanced_output`，包含：
 
 - `best_checkpoint.pt`
 - `training_history.csv`

@@ -59,6 +59,7 @@ class Config:
     num_workers: int = 0
     learning_rate: float = float(os.environ.get("DL_TCN_LEARNING_RATE", "5e-4"))
     weight_decay: float = float(os.environ.get("DL_TCN_WEIGHT_DECAY", "1e-4"))
+    loss_name: str = "station_balanced_mse"
     gradient_clip_norm: float = 5.0
     smoke_epochs: int = 2
     smoke_max_train_batches: int = 20
@@ -72,8 +73,8 @@ class Config:
 
     # Formal 60/12 supervised training (no outer test/refit/search).
     max_epochs: int = int(os.environ.get("DL_TCN_MAX_EPOCHS", "15"))
-    early_stopping_patience: int = int(os.environ.get("DL_TCN_PATIENCE", "7"))
-    formal_output_dirname: str = "DL_TCN_CA_v1_formal_lr5e-4_output"
+    early_stopping_patience: int = int(os.environ.get("DL_TCN_PATIENCE", "5"))
+    formal_output_dirname: str = "DL_TCN_CA_v1_formal_lr5e-4_station_balanced_output"
     progress_every_batches: int = 1000
     formal_num_workers: int = int(os.environ.get("DL_TCN_NUM_WORKERS", "0"))
     prefetch_factor: int = int(os.environ.get("DL_TCN_PREFETCH_FACTOR", "4"))
