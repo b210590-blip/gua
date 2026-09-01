@@ -161,3 +161,31 @@ OOF評估時每次完整排除被預測站的類別與epoch曲線：分類器只
 %env DL_TCN_MAX_EPOCHS=15
 !python analyze_interpretable_epoch_rules.py
 ```
+
+## 最佳化固定checkpoint規則樹
+
+`evaluate_optimized_epoch_rule.py`使用已由72站搜尋完成的固定透明規則樹，共13個葉節點。規則使用交通比例、道路／工業區距離、森林比例、地形起伏、NDVI、經緯度與工業比例，輸出fold-relative offset。程式重現72站epoch MAE、分類正確率與RMSE後，會在完全不讀outer truth的情況下建立`LOCKED_OUTER_EPOCH_BEFORE_TRUTH.json`。
+
+```python
+%env DL_TCN_CROSSFIT_ROOT=/content/crossfit_target_conditioned_snapshots
+%env DL_TCN_DATA_ROOT=/content/dl_tcn_data
+!python evaluate_optimized_epoch_rule.py
+```
+
+## 組內細分checkpoint規則樹
+
+`evaluate_refined_epoch_rule.py`沿用early／middle／late概念，再用static features細分為30個透明葉節點；每葉至少有2個known stations。輸出仍是相對於該次60/12訓練reference epoch的offset。程式先重現known-72開發結果，再只讀outer static並建立`LOCKED_OUTER_REFINED_EPOCH_BEFORE_TRUTH.json`，不讀outer PM2.5 truth。
+
+```python
+%env DL_TCN_CROSSFIT_ROOT=/content/crossfit_target_conditioned_snapshots
+%env DL_TCN_DATA_ROOT=/content/dl_tcn_data
+!python evaluate_refined_epoch_rule.py
+```
+
+規則鎖定後，才可對outer target解盲並計算完整epoch 1–15曲線：
+
+```python
+!python evaluate_outer_epoch_curve.py
+```
+
+輸出`outer_epoch_curve_metrics.csv`、壓縮逐時預測`outer_epoch_curve_predictions.npz`、`outer_locked_vs_oracle.json`與RMSE曲線`outer_epoch_curve_rmse.png`。`locked_epoch_before_truth`固定沿用上一階段的truth-free決策，不會被oracle曲線覆寫。
