@@ -96,6 +96,84 @@ def candidate_weights_from_60(history: pd.DataFrame) -> list[dict]:
     return candidates
 
 
+def meta_features(base: pd.DataFrame, matrix: np.ndarray, prior: np.ndarray) -> np.ndarray:
+    """Only model predictions and known clock time; never target observations."""
+    ensemble = matrix @ prior
+    disagreement = matrix - ensemble[:, None]
+    timestamp = pd.to_datetime(base["timestamp"], errors="raise")
+    hour_angle = 2.0 * np.pi * timestamp.dt.hour.to_numpy(float) / 24.0
+    year_angle = 2.0 * np.pi * (timestamp.dt.dayofyear.to_numpy(float) - 1.0) / 365.25
+    return np.column_stack([
+        ensemble,
+        disagreement,
+        matrix.std(axis=1),
+        matrix.max(axis=1) - matrix.min(axis=1),
+        np.sin(hour_angle), np.cos(hour_angle),
+        np.sin(year_angle), np.cos(year_angle),
+    ])
+
+
+def fit_ridge_residual(
+    features: np.ndarray,
+    residual: np.ndarray,
+    station: np.ndarray,
+    alpha: float,
+) -> dict:
+    # Each station contributes total weight 1, regardless of timestamp coverage.
+    unique, counts = np.unique(station, return_counts=True)
+    count_map = dict(zip(unique.tolist(), counts.tolist()))
+    sample_weight = np.asarray([1.0 / count_map[int(s)] for s in station], dtype=float)
+    weight_sum = sample_weight.sum()
+    mean_x = (sample_weight[:, None] * features).sum(axis=0) / weight_sum
+    scale_x = np.sqrt(
+        (sample_weight[:, None] * (features - mean_x) ** 2).sum(axis=0) / weight_sum
+    )
+    scale_x = np.where(scale_x > 1e-8, scale_x, 1.0)
+    x = (features - mean_x) / scale_x
+    mean_y = float(np.sum(sample_weight * residual) / weight_sum)
+    yc = residual - mean_y
+    gram = x.T @ (sample_weight[:, None] * x)
+    rhs = x.T @ (sample_weight * yc)
+    coefficient = np.linalg.solve(gram + alpha * np.eye(x.shape[1]), rhs)
+    return {
+        "mean_x": mean_x,
+        "scale_x": scale_x,
+        "mean_y": mean_y,
+        "coefficient": coefficient,
+    }
+
+
+def predict_ridge_residual(model: dict, features: np.ndarray) -> np.ndarray:
+    x = (features - model["mean_x"]) / model["scale_x"]
+    return model["mean_y"] + x @ model["coefficient"]
+
+
+def nested_station_ridge(
+    base: pd.DataFrame,
+    matrix: np.ndarray,
+    prior: np.ndarray,
+) -> tuple[dict, list[dict]]:
+    features = meta_features(base, matrix, prior)
+    truth = base.y_true.to_numpy(float)
+    prior_prediction = matrix @ prior
+    residual = truth - prior_prediction
+    station = base.station_index.to_numpy(int)
+    stations = np.unique(station)
+    scores = []
+    for alpha in (0.01, 0.1, 1.0, 10.0, 100.0, 1000.0):
+        held_rmse = []
+        for held in stations:
+            train = station != held
+            test = ~train
+            model = fit_ridge_residual(features[train], residual[train], station[train], alpha)
+            prediction = prior_prediction[test] + predict_ridge_residual(model, features[test])
+            held_rmse.append(float(np.sqrt(np.mean((truth[test] - prediction) ** 2))))
+        scores.append({"alpha": alpha, "station_loso_macro_rmse": float(np.mean(held_rmse))})
+    selected = min(scores, key=lambda row: row["station_loso_macro_rmse"])
+    final_model = fit_ridge_residual(features, residual, station, selected["alpha"])
+    return final_model, scores
+
+
 def build_context(root: Path):
     paths = [root / "fold_00" / "epoch_checkpoints" / f"epoch_{epoch:03d}.pt" for epoch in EPOCHS]
     missing = [path.name for path in paths if not path.is_file()]
@@ -189,6 +267,13 @@ def main() -> None:
         scored.append({**candidate, "held12_macro_rmse": float(np.mean(held_rmse))})
     selected = min(scored, key=lambda row: row["held12_macro_rmse"])
     weights = selected["weight"]
+    ridge_model, ridge_scores = nested_station_ridge(
+        validation_base, validation_matrix, weights
+    )
+    ridge_selected = min(ridge_scores, key=lambda row: row["station_loso_macro_rmse"])
+    deploy_stacker = (
+        ridge_selected["station_loso_macro_rmse"] < selected["held12_macro_rmse"]
+    )
     lock = {
         "protocol": "60 stations from metric folds 1..5 create weights; fold_00 12 stations select candidate; lock before Taoyuan truth",
         "selection_used_taoyuan_truth": False,
@@ -206,6 +291,15 @@ def main() -> None:
             {"epoch": epoch, "weight": float(weight)}
             for epoch, weight in zip(EPOCHS, weights) if weight > 1e-8
         ],
+        "ridge_residual_stacker": {
+            "selection": "leave-one-validation-station-out",
+            "uses_taoyuan_truth": False,
+            "candidate_scores": ridge_scores,
+            "selected_alpha": ridge_selected["alpha"],
+            "nested_macro_rmse": ridge_selected["station_loso_macro_rmse"],
+            "accepted_before_taoyuan_truth": deploy_stacker,
+            "acceptance_rule": "station-LOSO RMSE must beat the locked base ensemble score",
+        },
     }
     print("\nLOCKED 60+12 ENSEMBLE BEFORE TAOYUAN TRUTH")
     print(json.dumps(lock, ensure_ascii=False, indent=2), flush=True)
@@ -214,13 +308,25 @@ def main() -> None:
     outer_base, outer_matrix = aligned_predictions(
         model, paths, outer_loader, CFG.device, static, timestamps, outer_builder
     )
-    prediction = outer_matrix @ weights
+    base_prediction = outer_matrix @ weights
+    outer_features = meta_features(outer_base, outer_matrix, weights)
+    stacked_prediction = base_prediction + predict_ridge_residual(ridge_model, outer_features)
+    deployed_prediction = stacked_prediction if deploy_stacker else base_prediction
     result = {
         "target_station_index": int(outer),
         "siteid": str(static.loc[outer, "siteid"]),
         "sitename": str(static.loc[outer, "sitename"]),
         "selection_used_taoyuan_truth": False,
-        "metrics": regression_metrics(outer_base.y_true.to_numpy(float), prediction),
+        "base_ensemble_metrics": regression_metrics(
+            outer_base.y_true.to_numpy(float), base_prediction
+        ),
+        "ridge_residual_stacker_metrics": regression_metrics(
+            outer_base.y_true.to_numpy(float), stacked_prediction
+        ),
+        "deployed_method": "ridge_residual_stacker" if deploy_stacker else "base_ensemble",
+        "deployed_metrics": regression_metrics(
+            outer_base.y_true.to_numpy(float), deployed_prediction
+        ),
         "selected_method": lock["selected_method"],
         "weights": lock["weights"],
         "files_written": 0,
