@@ -90,8 +90,10 @@ def run_fold(
     seed_all(CFG.seed+fold_id*1009)
     fold_dir=root/f"fold_{fold_id:02d}"
     epoch_dir=fold_dir/"epoch_checkpoints"; prediction_dir=fold_dir/"epoch_predictions"
-    metric_dir=fold_dir/"epoch_station_metrics"
-    for path in (fold_dir,epoch_dir,prediction_dir,metric_dir): path.mkdir(parents=True,exist_ok=True)
+    station_metric_path=fold_dir/"validation_station_metrics_all_epochs.csv"
+    paths=[fold_dir,epoch_dir]
+    if save_epoch_predictions(): paths.append(prediction_dir)
+    for path in paths: path.mkdir(parents=True,exist_ok=True)
     complete_path=fold_dir/"COMPLETE.json"
     if complete_path.exists():
         print(f"fold {fold_id}: COMPLETE exists, skip",flush=True)
@@ -183,7 +185,15 @@ def run_fold(
         history.append(row)
         pd.DataFrame(history).to_csv(fold_dir/"training_history.csv",index=False,encoding="utf-8-sig")
         station_metrics.insert(0,"fold",fold_id); station_metrics.insert(1,"epoch",epoch)
-        station_metrics.to_csv(metric_dir/f"epoch_{epoch:03d}.csv",index=False,encoding="utf-8-sig")
+        if station_metric_path.exists():
+            previous_station_metrics=pd.read_csv(station_metric_path,encoding="utf-8-sig")
+            previous_station_metrics=previous_station_metrics[previous_station_metrics["epoch"]!=epoch]
+            station_history=pd.concat([previous_station_metrics,station_metrics],ignore_index=True)
+        else:
+            station_history=station_metrics
+        station_history.sort_values(["epoch","station_index"]).to_csv(
+            station_metric_path,index=False,encoding="utf-8-sig"
+        )
         if save_epoch_predictions():
             np.savez_compressed(
                 prediction_dir/f"epoch_{epoch:03d}.npz",
@@ -209,10 +219,6 @@ def run_fold(
             f"valid={validation_seconds:.1f}s total={runtime:.1f}s",flush=True,
         )
 
-    metric_files=sorted(metric_dir.glob("epoch_*.csv"))
-    pd.concat([pd.read_csv(x,encoding="utf-8-sig") for x in metric_files],ignore_index=True).to_csv(
-        fold_dir/"validation_station_metrics_all_epochs.csv",index=False,encoding="utf-8-sig"
-    )
     summary={
         **split,"epochs_completed":CFG.max_epochs,"runtime_seconds":time.perf_counter()-fold_started,
         "snapshot_directory":str(epoch_dir),"prediction_directory":str(prediction_dir),
@@ -220,6 +226,8 @@ def run_fold(
         "fused_adamw":fused,"device":str(device),
     }
     complete_path.write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
+    if resume_path.exists():
+        resume_path.unlink()
     del model,optimizer,grad_scaler,feature_builder,train_loader,val_loader,train_ds,val_ds
     gc.collect()
     if device.type=="cuda": torch.cuda.empty_cache()

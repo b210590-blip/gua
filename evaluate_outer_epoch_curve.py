@@ -163,13 +163,24 @@ def main() -> None:
         "selection_used_outer_truth": False,
     }
     curve.to_csv(output / "outer_epoch_curve_metrics.csv", index=False, encoding="utf-8-sig")
+    prediction_matrix = np.stack(prediction_columns, axis=1)
     np.savez_compressed(
-        output / "outer_epoch_curve_predictions.npz",
-        epochs=np.asarray(epochs, dtype=np.int16),
+        output / "outer_locked_oracle_predictions.npz",
         timestamp_ns=pd.to_datetime(base.timestamp).astype("int64").to_numpy(),
         y_true=base.y_true.to_numpy("float32"),
-        y_pred=np.stack(prediction_columns, axis=1),
+        locked_epoch=np.asarray([locked_epoch], dtype=np.int16),
+        oracle_epoch=np.asarray([oracle_epoch], dtype=np.int16),
+        y_pred_locked=prediction_matrix[:, epochs.index(locked_epoch)],
+        y_pred_oracle=prediction_matrix[:, epochs.index(oracle_epoch)],
     )
+    if os.environ.get("DL_TCN_SAVE_FULL_OUTER_CURVE_PREDICTIONS", "0").strip() == "1":
+        np.savez_compressed(
+            output / "outer_epoch_curve_predictions_all_epochs.npz",
+            epochs=np.asarray(epochs, dtype=np.int16),
+            timestamp_ns=pd.to_datetime(base.timestamp).astype("int64").to_numpy(),
+            y_true=base.y_true.to_numpy("float32"),
+            y_pred=prediction_matrix,
+        )
     (output / "outer_locked_vs_oracle.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )

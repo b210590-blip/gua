@@ -194,4 +194,6 @@ OOF評估時每次完整排除被預測站的類別與epoch曲線：分類器只
 
 只為桃園復原fold 0時可設`DL_TCN_SAVE_EPOCH_PREDICTIONS=0`，略過不再需要的validation逐時NPZ；epoch checkpoints、validation metrics與resume state仍會完整保存。
 
+精簡輸出模式不再建立每個epoch各一份station metrics；程式只維護單一`validation_station_metrics_all_epochs.csv`。成功完成fold後會移除已無用途的`last_training_state.pt`。Outer曲線預設只保存locked與oracle兩組逐時預測；只有明確設定`DL_TCN_SAVE_FULL_OUTER_CURVE_PREDICTIONS=1`才保存15個epoch的完整預測矩陣。
+
 `benchmark_training_bottleneck.py`會用少量batch分別計時index loader、GPU feature assembly、forward/loss及backward/optimizer，輸出`training_bottleneck_profile.json`；它不保存或取代正式模型。
