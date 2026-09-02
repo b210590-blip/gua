@@ -189,3 +189,9 @@ OOF評估時每次完整排除被預測站的類別與epoch曲線：分類器只
 ```
 
 輸出`outer_epoch_curve_metrics.csv`、壓縮逐時預測`outer_epoch_curve_predictions.npz`、`outer_locked_vs_oracle.json`與RMSE曲線`outer_epoch_curve_rmse.png`。`locked_epoch_before_truth`固定沿用上一階段的truth-free決策，不會被oracle曲線覆寫。
+
+若只剩fold 0（例如Colab runtime被回收後復原），可設定`DL_TCN_REFINED_DEPLOY_ONLY=1`。此模式只讀fold 0的12站validation曲線計算reference epoch，不要求另外五折存在。
+
+只為桃園復原fold 0時可設`DL_TCN_SAVE_EPOCH_PREDICTIONS=0`，略過不再需要的validation逐時NPZ；epoch checkpoints、validation metrics與resume state仍會完整保存。
+
+`benchmark_training_bottleneck.py`會用少量batch分別計時index loader、GPU feature assembly、forward/loss及backward/optimizer，輸出`training_bottleneck_profile.json`；它不保存或取代正式模型。

@@ -51,6 +51,10 @@ def requested_folds() -> list[int]:
     return folds
 
 
+def save_epoch_predictions() -> bool:
+    return os.environ.get("DL_TCN_SAVE_EPOCH_PREDICTIONS", "1").strip() != "0"
+
+
 def scaler_payload(scaler) -> dict:
     return {
         "dynamic_mean":scaler.dynamic_mean,"dynamic_std":scaler.dynamic_std,
@@ -160,22 +164,34 @@ def run_fold(
     for epoch in range(start_epoch,CFG.max_epochs+1):
         epoch_started=time.perf_counter()
         if device.type=="cuda": torch.cuda.reset_peak_memory_stats(device)
+        train_started=time.perf_counter()
         train_loss=train_epoch(model,train_loader,optimizer,grad_scaler,device,epoch,feature_builder,station_weights)
+        if device.type=="cuda": torch.cuda.synchronize(device)
+        train_seconds=time.perf_counter()-train_started
+        validation_started=time.perf_counter()
         metrics,station_metrics,predictions=validate_epoch(model,val_loader,device,static,timestamps,epoch,feature_builder)
+        if device.type=="cuda": torch.cuda.synchronize(device)
+        validation_seconds=time.perf_counter()-validation_started
         runtime=time.perf_counter()-epoch_started
         peak=torch.cuda.max_memory_allocated(device)/1024**2 if device.type=="cuda" else 0.0
-        row={"fold":fold_id,"epoch":epoch,"train_loss":train_loss,**{f"validation_{k}":v for k,v in metrics.items()},"epoch_runtime_seconds":runtime,"gpu_peak_vram_mb":peak}
+        row={
+            "fold":fold_id,"epoch":epoch,"train_loss":train_loss,
+            **{f"validation_{k}":v for k,v in metrics.items()},
+            "train_seconds":train_seconds,"validation_seconds":validation_seconds,
+            "epoch_runtime_seconds":runtime,"gpu_peak_vram_mb":peak,
+        }
         history.append(row)
         pd.DataFrame(history).to_csv(fold_dir/"training_history.csv",index=False,encoding="utf-8-sig")
         station_metrics.insert(0,"fold",fold_id); station_metrics.insert(1,"epoch",epoch)
         station_metrics.to_csv(metric_dir/f"epoch_{epoch:03d}.csv",index=False,encoding="utf-8-sig")
-        np.savez_compressed(
-            prediction_dir/f"epoch_{epoch:03d}.npz",
-            station_index=predictions["station_index"].to_numpy("int16"),
-            timestamp_ns=pd.to_datetime(predictions["timestamp"]).astype("int64").to_numpy(),
-            y_true=predictions["y_true"].to_numpy("float32"),
-            y_pred=predictions["y_pred"].to_numpy("float32"),
-        )
+        if save_epoch_predictions():
+            np.savez_compressed(
+                prediction_dir/f"epoch_{epoch:03d}.npz",
+                station_index=predictions["station_index"].to_numpy("int16"),
+                timestamp_ns=pd.to_datetime(predictions["timestamp"]).astype("int64").to_numpy(),
+                y_true=predictions["y_true"].to_numpy("float32"),
+                y_pred=predictions["y_pred"].to_numpy("float32"),
+            )
         checkpoint={
             "fold":fold_id,"epoch":epoch,"model_state_dict":cpu_state_dict(model),
             "validation_metrics":metrics,"train_indices":train_idx,"validation_indices":val_idx,
@@ -189,7 +205,8 @@ def run_fold(
         },resume_path)
         print(
             f"fold {fold_id} epoch {epoch}: MacroRMSE={metrics['macro_station_rmse']:.4f} "
-            f"pooledR2={metrics['r2']:.4f} runtime={runtime:.1f}s",flush=True,
+            f"pooledR2={metrics['r2']:.4f} train={train_seconds:.1f}s "
+            f"valid={validation_seconds:.1f}s total={runtime:.1f}s",flush=True,
         )
 
     metric_files=sorted(metric_dir.glob("epoch_*.csv"))
@@ -199,6 +216,7 @@ def run_fold(
     summary={
         **split,"epochs_completed":CFG.max_epochs,"runtime_seconds":time.perf_counter()-fold_started,
         "snapshot_directory":str(epoch_dir),"prediction_directory":str(prediction_dir),
+        "epoch_predictions_saved":save_epoch_predictions(),
         "fused_adamw":fused,"device":str(device),
     }
     complete_path.write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")

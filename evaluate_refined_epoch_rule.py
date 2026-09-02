@@ -91,6 +91,36 @@ def main() -> None:
     output = Path(os.environ.get("DL_TCN_REFINED_RULE_OUTPUT", str(root / "refined_epoch_rule")))
     output.mkdir(parents=True, exist_ok=True)
     rules = load_rules()
+    deploy_only = os.environ.get("DL_TCN_REFINED_DEPLOY_ONLY", "0").strip() == "1"
+    if deploy_only:
+        fold0_path = root / "fold_00" / "validation_station_metrics_all_epochs.csv"
+        if not fold0_path.is_file():
+            raise FileNotFoundError(f"fold 0 metrics不存在：{fold0_path}")
+        history = pd.read_csv(fold0_path, encoding="utf-8-sig")
+        history["fold"] = 0
+        history["station_index"] = history.station_index.astype(int)
+        history["epoch"] = history.epoch.astype(int)
+        static, _, _ = load_static()
+        outer_matches = static.index[static.sitename.astype(str) == str(CFG.target_site)].to_numpy()
+        if len(outer_matches) != 1:
+            raise RuntimeError(f"outer target {CFG.target_site}無法唯一定位")
+        outer = int(outer_matches[0])
+        outer_leaf, outer_offset, outer_rule = select_rule(static.loc[outer], rules)
+        fold0_reference = reference_epoch(history, 0, None)
+        locked = {
+            "target_site": CFG.target_site, "target_station_index": outer,
+            "leaf": outer_leaf, "matched_rule": outer_rule, "offset": outer_offset,
+            "fold0_reference_epoch": fold0_reference,
+            "locked_epoch": int(np.clip(fold0_reference + outer_offset, 1, 15)),
+            "outer_truth_read": False, "deploy_only_from_fold0": True,
+        }
+        (output / "LOCKED_OUTER_REFINED_EPOCH_BEFORE_TRUTH.json").write_text(
+            json.dumps(locked, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print("DEPLOY-ONLY LOCKED OUTER")
+        print(json.dumps(locked, ensure_ascii=False, indent=2))
+        print(f"\nOutput: {output}")
+        return
     history = load_history(root)
     oracle = oracle_table(history)
     static, _, _ = load_static()
