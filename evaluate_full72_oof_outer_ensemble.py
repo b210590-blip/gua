@@ -16,11 +16,6 @@ from data_pipeline import (
     load_static,
     standardize_static,
 )
-from evaluate_72_oof_snapshot_ensemble import (
-    fit_ridge_residual,
-    meta_features,
-    predict_ridge_residual,
-)
 from evaluate_outer import load_checkpoint, scaler_from_checkpoint
 from evaluate_validation_only_snapshot_ensemble import (
     EPOCHS,
@@ -46,7 +41,6 @@ METHOD_SPECS = (
     ('best_epoch_frequency', 0.0),
     *(('convex_ridge', float(x)) for x in (0.0, 0.01, 0.1, 1.0, 10.0)),
 )
-RIDGE_ALPHAS = (0.01, 0.1, 1.0, 10.0, 100.0, 1000.0)
 
 
 def load_fold_oof(root: Path, fold: int) -> tuple[pd.DataFrame, np.ndarray]:
@@ -130,6 +124,71 @@ def macro_rmse(base: pd.DataFrame, prediction: np.ndarray, stations: np.ndarray)
     return float(np.mean([station_rmse(base, prediction, int(s)) for s in stations]))
 
 
+def station_bias(base: pd.DataFrame, prediction: np.ndarray, station: int) -> float:
+    keep = base.station_index.to_numpy(int) == int(station)
+    truth = base.y_true.to_numpy(float)[keep]
+    return float(np.mean(prediction[keep] - truth))
+
+
+def fit_fold_calibration(
+    base: pd.DataFrame,
+    matrix: np.ndarray,
+    epoch_weights: np.ndarray,
+    selected_method: dict,
+) -> tuple[list[dict], bool]:
+    """Estimate each fold's offset/reliability using only its 12 OOF stations."""
+    deployment_prior = matrix @ epoch_weights
+    rows = []
+    for fold in range(6):
+        stations = np.unique(base.loc[base.fold == fold, 'station_index'].to_numpy(int))
+        train_stations = np.unique(base.loc[base.fold != fold, 'station_index'].to_numpy(int))
+        evaluation_weights = fit_epoch_weights(
+            base, matrix, train_stations,
+            selected_method['family'], selected_method['parameter'],
+        )
+        evaluation_prior = matrix @ evaluation_weights
+        evaluation_biases = {
+            int(s): station_bias(base, evaluation_prior, int(s)) for s in stations
+        }
+        deployment_biases = {
+            int(s): station_bias(base, deployment_prior, int(s)) for s in stations
+        }
+        full_bias = float(np.mean(list(deployment_biases.values())))
+        raw_rmse = macro_rmse(base, evaluation_prior, stations)
+        held_rmse = []
+        for held in stations:
+            calibration_bias = float(np.mean([
+                value for station_id, value in evaluation_biases.items()
+                if station_id != int(held)
+            ]))
+            keep = base.station_index.to_numpy(int) == int(held)
+            truth = base.y_true.to_numpy(float)[keep]
+            corrected = evaluation_prior[keep] - calibration_bias
+            held_rmse.append(float(np.sqrt(np.mean((corrected - truth) ** 2))))
+        rows.append({
+            'fold': fold,
+            'oof_stations': int(len(stations)),
+            'oof_macro_bias': full_bias,
+            'raw_oof_macro_rmse': raw_rmse,
+            'station_loso_bias_corrected_macro_rmse': float(np.mean(held_rmse)),
+        })
+    raw_score = float(np.mean([row['raw_oof_macro_rmse'] for row in rows]))
+    corrected_score = float(np.mean([
+        row['station_loso_bias_corrected_macro_rmse'] for row in rows
+    ]))
+    use_bias_correction = corrected_score < raw_score
+    reliability = np.asarray([
+        row['station_loso_bias_corrected_macro_rmse']
+        if use_bias_correction else row['raw_oof_macro_rmse']
+        for row in rows
+    ], dtype=float)
+    reliability_weights = 1.0 / np.maximum(reliability, 1e-8) ** 2
+    reliability_weights /= reliability_weights.sum()
+    for row, weight in zip(rows, reliability_weights):
+        row['outer_model_weight'] = float(weight)
+    return rows, use_bias_correction
+
+
 def select_method_by_sixfold_oof(
     base: pd.DataFrame, matrix: np.ndarray
 ) -> tuple[dict, list[dict]]:
@@ -148,47 +207,6 @@ def select_method_by_sixfold_oof(
             'fold_rmse': held_scores,
         })
     return min(rows, key=lambda row: row['sixfold_oof_macro_rmse']), rows
-
-
-def select_residual_stacker(
-    base: pd.DataFrame, matrix: np.ndarray, method: dict
-) -> tuple[dict, dict]:
-    truth = base.y_true.to_numpy(float)
-    station = base.station_index.to_numpy(int)
-    fold_values = base.fold.to_numpy(int)
-    ridge_scores = {alpha: [] for alpha in RIDGE_ALPHAS}
-    base_scores = []
-    for fold in range(6):
-        train_rows = fold_values != fold
-        held_rows = ~train_rows
-        train_stations = np.unique(station[train_rows])
-        held_stations = np.unique(station[held_rows])
-        prior = fit_epoch_weights(
-            base, matrix, train_stations, method['family'], method['parameter']
-        )
-        prior_prediction = matrix @ prior
-        features = meta_features(base, matrix, prior)
-        residual = truth - prior_prediction
-        base_scores.append(macro_rmse(base, prior_prediction, held_stations))
-        for alpha in RIDGE_ALPHAS:
-            model = fit_ridge_residual(
-                features[train_rows], residual[train_rows], station[train_rows], alpha
-            )
-            prediction = prior_prediction + predict_ridge_residual(model, features)
-            ridge_scores[alpha].append(macro_rmse(base, prediction, held_stations))
-    rows = [
-        {'alpha': alpha, 'sixfold_oof_macro_rmse': float(np.mean(scores)), 'fold_rmse': scores}
-        for alpha, scores in ridge_scores.items()
-    ]
-    selected = min(rows, key=lambda row: row['sixfold_oof_macro_rmse'])
-    audit = {
-        'paired_base_sixfold_oof_macro_rmse': float(np.mean(base_scores)),
-        'ridge_candidates': rows,
-        'selected_alpha': selected['alpha'],
-        'selected_ridge_sixfold_oof_macro_rmse': selected['sixfold_oof_macro_rmse'],
-        'accepted': selected['sixfold_oof_macro_rmse'] < float(np.mean(base_scores)),
-    }
-    return selected, audit
 
 
 def build_outer_fold_context(
@@ -247,13 +265,8 @@ def main() -> None:
     final_weights = fit_epoch_weights(
         base, matrix, stations, method['family'], method['parameter']
     )
-    ridge_selected, ridge_audit = select_residual_stacker(base, matrix, method)
-    truth = base.y_true.to_numpy(float)
-    station = base.station_index.to_numpy(int)
-    features = meta_features(base, matrix, final_weights)
-    prior_prediction = matrix @ final_weights
-    final_ridge = fit_ridge_residual(
-        features, truth - prior_prediction, station, ridge_selected['alpha']
+    fold_calibration, use_bias_correction = fit_fold_calibration(
+        base, matrix, final_weights, method
     )
     lock = {
         'protocol': '72 disjoint OOF stations select ensemble; outer truth unused',
@@ -265,7 +278,11 @@ def main() -> None:
             {'epoch': int(epoch), 'weight': float(weight)}
             for epoch, weight in zip(EPOCHS, final_weights) if weight > 1e-8
         ],
-        'residual_stacker': ridge_audit,
+        'fold_calibration': {
+            'selection_used_outer_truth': False,
+            'bias_correction_accepted_by_station_loso': use_bias_correction,
+            'folds': fold_calibration,
+        },
     }
     print('\nLOCKED FULL-72 OOF ENSEMBLE BEFORE OUTER TRUTH')
     print(json.dumps(lock, ensure_ascii=False, indent=2), flush=True)
@@ -275,7 +292,7 @@ def main() -> None:
     cube, timestamps = build_or_load_hourly_cube(static)
     distance = haversine_matrix(static.longitude, static.latitude)
     fold_base_predictions = []
-    fold_stacked_predictions = []
+    fold_calibrated_predictions = []
     outer_base = None
     for fold in range(6):
         print(f'outer inference fold {fold}/5', flush=True)
@@ -298,28 +315,31 @@ def main() -> None:
                 raise RuntimeError('六個fold的outer truth沒有對齊')
         fold_prior = current_matrix @ final_weights
         fold_base_predictions.append(fold_prior)
-        fold_stacked_predictions.append(
-            fold_prior + predict_ridge_residual(
-                final_ridge, meta_features(current_base, current_matrix, final_weights)
-            )
-        )
+        correction = fold_calibration[fold]['oof_macro_bias'] if use_bias_correction else 0.0
+        fold_calibrated_predictions.append(fold_prior - correction)
     assert outer_base is not None
-    base_prediction = np.mean(fold_base_predictions, axis=0)
-    stacked_prediction = np.mean(fold_stacked_predictions, axis=0)
-    use_stacker = bool(ridge_audit['accepted'])
-    deployed = stacked_prediction if use_stacker else base_prediction
+    raw_equal_prediction = np.mean(fold_base_predictions, axis=0)
+    calibrated_equal_prediction = np.mean(fold_calibrated_predictions, axis=0)
+    fold_weights = np.asarray(
+        [row['outer_model_weight'] for row in fold_calibration], dtype=float
+    )
+    deployed = np.sum(
+        np.stack(fold_calibrated_predictions, axis=0) * fold_weights[:, None], axis=0
+    )
     result = {
         'target_station_index': int(outer),
         'siteid': str(static.loc[outer, 'siteid']),
         'sitename': str(static.loc[outer, 'sitename']),
         'selection_used_outer_truth': False,
-        'base_six_model_ensemble_metrics': regression_metrics(
-            outer_base.y_true.to_numpy(float), base_prediction
+        'raw_equal_six_model_metrics': regression_metrics(
+            outer_base.y_true.to_numpy(float), raw_equal_prediction
         ),
-        'ridge_six_model_ensemble_metrics': regression_metrics(
-            outer_base.y_true.to_numpy(float), stacked_prediction
+        'bias_corrected_equal_six_model_metrics': regression_metrics(
+            outer_base.y_true.to_numpy(float), calibrated_equal_prediction
         ),
-        'deployed_method': 'ridge_residual_stacker' if use_stacker else 'base_epoch_ensemble',
+        'deployed_method': 'oof_reliability_weighted_bias_corrected_epoch_ensemble',
+        'bias_correction_enabled': use_bias_correction,
+        'fold_model_weights': [float(x) for x in fold_weights],
         'deployed_metrics': regression_metrics(
             outer_base.y_true.to_numpy(float), deployed
         ),
