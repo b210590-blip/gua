@@ -135,7 +135,7 @@ def run_fold(
         if not hasattr(torch, "compile"):
             raise RuntimeError("目前PyTorch沒有torch.compile，請設DL_TCN_COMPILE_MODE=off")
         model=torch.compile(
-            base_model,mode=CFG.compile_mode,fullgraph=False,dynamic=False,
+            base_model,mode=CFG.compile_mode,fullgraph=False,dynamic=True,
         )
     amp_dtype=amp_dtype_for(device); grad_scaler=make_grad_scaler(amp_dtype==torch.float16)
     station_weights=make_station_sample_weights(train_ds,len(static),device)
