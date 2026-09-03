@@ -44,6 +44,9 @@ def main() -> None:
 
     warmup_batches = int(os.environ.get("DL_TCN_PROFILE_WARMUP_BATCHES", "5"))
     measured_batches = int(os.environ.get("DL_TCN_PROFILE_BATCHES", "50"))
+    compile_mode = os.environ.get("DL_TCN_COMPILE_MODE", "off").strip().lower()
+    if compile_mode not in {"off", "default", "reduce-overhead"}:
+        raise ValueError("DL_TCN_COMPILE_MODE只能是off/default/reduce-overhead")
     output = Path(os.environ.get("DL_TCN_PROFILE_OUTPUT", "/content/training_bottleneck_profile"))
     output.mkdir(parents=True, exist_ok=True)
 
@@ -63,8 +66,18 @@ def main() -> None:
         static, static_scaled, distance, scaler, outer, device,
     )
     loader = make_index_loader(train_ds, True)
-    model = TCNTargetCrossAttention(static_dim=len(static_cols)).to(device)
-    optimizer, fused = make_optimizer(model, device)
+    base_model = TCNTargetCrossAttention(static_dim=len(static_cols)).to(device)
+    model = base_model
+    if compile_mode != "off":
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("目前PyTorch沒有torch.compile")
+        model = torch.compile(
+            base_model,
+            mode=compile_mode,
+            fullgraph=False,
+            dynamic=False,
+        )
+    optimizer, fused = make_optimizer(base_model, device)
     amp_dtype = amp_dtype_for(device)
     grad_scaler = make_grad_scaler(amp_dtype == torch.float16)
     station_weights = make_station_sample_weights(train_ds, len(static), device)
@@ -72,9 +85,11 @@ def main() -> None:
     timings = {"loader_wait_ms": [], "feature_build_ms": [], "forward_loss_ms": [], "backward_step_ms": []}
     total_samples = 0
     previous_end = time.perf_counter()
+    first_batch_wall_seconds = None
     limit = warmup_batches + measured_batches
     for batch_number, index_batch in enumerate(loader, start=1):
-        loader_wait_ms = (time.perf_counter() - previous_end) * 1000.0
+        batch_wall_started = time.perf_counter()
+        loader_wait_ms = (batch_wall_started - previous_end) * 1000.0
         events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
         events[0].record()
         batch = builder(index_batch)
@@ -95,6 +110,8 @@ def main() -> None:
         grad_scaler.update()
         events[3].record()
         torch.cuda.synchronize(device)
+        if batch_number == 1:
+            first_batch_wall_seconds = time.perf_counter() - batch_wall_started
         if batch_number > warmup_batches:
             timings["loader_wait_ms"].append(loader_wait_ms)
             timings["feature_build_ms"].append(events[0].elapsed_time(events[1]))
@@ -126,6 +143,8 @@ def main() -> None:
         "precompute_seconds": builder.precompute_seconds,
         "precomputed_tables_mb": builder.precomputed_table_mb,
         "fused_adamw": fused,
+        "compile_mode": compile_mode,
+        "first_batch_wall_seconds_including_lazy_compile": first_batch_wall_seconds,
         **means,
         **percentages,
         "measured_samples_per_second": samples_per_second,
