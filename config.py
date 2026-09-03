@@ -83,6 +83,9 @@ class Config:
     l4_num_workers: int = 4
     smoke_batch_size: int = 8
     gpu_precompute_chunk_hours: int = 512
+    # "auto" enables the benchmarked reduce-overhead graph on A100 only.
+    # Set DL_TCN_COMPILE_MODE=off to disable it for troubleshooting.
+    compile_mode: str = os.environ.get("DL_TCN_COMPILE_MODE", "auto").strip().lower()
 
     @property
     def dynamic_items(self) -> tuple[str, ...]:
@@ -110,15 +113,19 @@ def apply_runtime_profile(cfg: Config = CFG) -> dict:
         "amp_dtype": "disabled",
         "gpu_name": None,
         "gpu_vram_gb": 0.0,
+        "compile_mode": "off" if cfg.compile_mode == "auto" else cfg.compile_mode,
     }
     if not torch.cuda.is_available():
+        if cfg.compile_mode == "auto":
+            cfg.compile_mode = "off"
         return profile
 
     gpu_name = torch.cuda.get_device_name(0)
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
     is_l4 = "L4" in gpu_name.upper()
+    is_a100 = "A100" in gpu_name.upper()
     if "DL_TCN_BATCH_SIZE" not in os.environ:
-        cfg.batch_size = cfg.l4_batch_size if is_l4 else (256 if vram_gb >= 14 else (128 if vram_gb >= 8 else 64))
+        cfg.batch_size = 1024 if is_a100 else (cfg.l4_batch_size if is_l4 else (256 if vram_gb >= 14 else (128 if vram_gb >= 8 else 64)))
     if "DL_TCN_NUM_WORKERS" not in os.environ:
         cfg.formal_num_workers = min(cfg.l4_num_workers if is_l4 else 2, max(cpu_count - 1, 0))
 
@@ -127,13 +134,18 @@ def apply_runtime_profile(cfg: Config = CFG) -> dict:
         cfg.use_amp and cfg.prefer_bf16 and compute_capability[0] >= 8
         and torch.cuda.is_bf16_supported()
     )
+    if cfg.compile_mode == "auto":
+        cfg.compile_mode = "reduce-overhead" if is_a100 else "off"
+    if cfg.compile_mode not in {"off", "default", "reduce-overhead"}:
+        raise ValueError("DL_TCN_COMPILE_MODE只能是auto/off/default/reduce-overhead")
     profile.update({
-        "name": "colab_l4" if is_l4 else "cuda_auto",
+        "name": "colab_a100" if is_a100 else ("colab_l4" if is_l4 else "cuda_auto"),
         "gpu_name": gpu_name,
         "gpu_vram_gb": vram_gb,
         "compute_capability": f"{compute_capability[0]}.{compute_capability[1]}",
         "batch_size": cfg.batch_size,
         "num_workers": cfg.formal_num_workers,
         "amp_dtype": "bfloat16" if bf16 else ("float16" if cfg.use_amp else "disabled"),
+        "compile_mode": cfg.compile_mode,
     })
     return profile
