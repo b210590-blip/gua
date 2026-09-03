@@ -147,6 +147,9 @@ def main() -> None:
         summary_path = drive_root / 'station_summaries' / f'site_{token}.json'
         prediction_path = drive_root / 'station_predictions' / f'site_{token}.npz'
         if summary_path.is_file() and prediction_path.is_file():
+            leftover = active_root / f'site_{token}'
+            if leftover.exists():
+                remove_completed_temporary(leftover, active_root)
             print(f'[{position}/{len(sites)}] {siteid} {site["sitename"]}: completed, skip', flush=True)
             continue
         if maximum_new > 0 and completed_now >= maximum_new:

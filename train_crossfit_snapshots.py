@@ -99,6 +99,18 @@ def atomic_prediction_save(path: Path, predictions: pd.DataFrame) -> None:
     os.replace(temporary,path)
 
 
+def atomic_text_save(path: Path, text: str) -> None:
+    temporary=path.with_suffix(path.suffix+".tmp")
+    temporary.write_text(text,encoding="utf-8")
+    os.replace(temporary,path)
+
+
+def atomic_csv_save(frame: pd.DataFrame, path: Path) -> None:
+    temporary=path.with_suffix(path.suffix+".tmp")
+    frame.to_csv(temporary,index=False,encoding="utf-8-sig")
+    os.replace(temporary,path)
+
+
 def run_fold(
     fold_id:int,train_idx:np.ndarray,val_idx:np.ndarray,outer:int,
     static:pd.DataFrame,clusters:np.ndarray,static_cols:list[str],cube,timestamps,distance,
@@ -168,8 +180,8 @@ def run_fold(
         "validation_clusters":sorted(np.unique(clusters[val_idx]).astype(int).tolist()),
         "training_donors":59,"validation_donors":60,
     }
-    (fold_dir/"split.json").write_text(json.dumps(split,ensure_ascii=False,indent=2),encoding="utf-8")
-    (fold_dir/"sanity.json").write_text(json.dumps({"split":split,"model":smoke},ensure_ascii=False,indent=2),encoding="utf-8")
+    atomic_text_save(fold_dir/"split.json",json.dumps(split,ensure_ascii=False,indent=2))
+    atomic_text_save(fold_dir/"sanity.json",json.dumps({"split":split,"model":smoke},ensure_ascii=False,indent=2))
 
     resume_path=fold_dir/"last_training_state.pt"
     start_epoch=1; history=[]; fold_started=time.perf_counter()
@@ -209,7 +221,7 @@ def run_fold(
             "epoch_runtime_seconds":runtime,"gpu_peak_vram_mb":peak,
         }
         history.append(row)
-        pd.DataFrame(history).to_csv(fold_dir/"training_history.csv",index=False,encoding="utf-8-sig")
+        atomic_csv_save(pd.DataFrame(history),fold_dir/"training_history.csv")
         station_metrics.insert(0,"fold",fold_id); station_metrics.insert(1,"epoch",epoch)
         if station_metric_path.exists():
             previous_station_metrics=pd.read_csv(station_metric_path,encoding="utf-8-sig")
@@ -217,8 +229,8 @@ def run_fold(
             station_history=pd.concat([previous_station_metrics,station_metrics],ignore_index=True)
         else:
             station_history=station_metrics
-        station_history.sort_values(["epoch","station_index"]).to_csv(
-            station_metric_path,index=False,encoding="utf-8-sig"
+        atomic_csv_save(
+            station_history.sort_values(["epoch","station_index"]),station_metric_path
         )
         if save_epoch_predictions():
             atomic_prediction_save(prediction_dir/f"epoch_{epoch:03d}.npz",predictions)
@@ -245,7 +257,7 @@ def run_fold(
         "epoch_predictions_saved":save_epoch_predictions(),
         "fused_adamw":fused,"device":str(device),"compile_mode":CFG.compile_mode,
     }
-    complete_path.write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
+    atomic_text_save(complete_path,json.dumps(summary,ensure_ascii=False,indent=2))
     if resume_path.exists():
         resume_path.unlink()
     del model,base_model,optimizer,grad_scaler,feature_builder,train_loader,val_loader,train_ds,val_ds
@@ -274,7 +286,7 @@ def main() -> None:
         "epochs":CFG.max_epochs,"requested_folds":requested_folds(),"runtime_profile":runtime,
         "folds":[{"fold":i,"train":tr.tolist(),"validation":va.tolist()} for i,(tr,va) in enumerate(folds)],
     }
-    (root/"crossfit_manifest.json").write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding="utf-8")
+    atomic_text_save(root/"crossfit_manifest.json",json.dumps(manifest,ensure_ascii=False,indent=2))
     cube,timestamps=build_or_load_hourly_cube(static); distance=haversine_matrix(static.longitude,static.latitude)
     summaries=[]
     for fold_id in requested_folds():
