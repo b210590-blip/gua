@@ -116,7 +116,8 @@ def run_fold(
     if audit_dataset(val_ds,max_samples=32)["sampled_donor_counts"]!=[60]:
         raise RuntimeError(f"fold {fold_id} validation donors不是60")
 
-    model=TCNTargetCrossAttention(static_dim=len(static_cols)).to(device)
+    base_model=TCNTargetCrossAttention(static_dim=len(static_cols)).to(device)
+    model=base_model
     feature_builder=None
     if device.type=="cuda":
         max_time_index=int(max(train_ds.row_times.max(),val_ds.row_times.max()))
@@ -127,9 +128,15 @@ def run_fold(
     else:
         train_loader=make_vectorized_loader(train_ds,train_idx,cube,timestamps,static,static_scaled,distance,scaler,True)
         val_loader=make_vectorized_loader(val_ds,train_idx,cube,timestamps,static,static_scaled,distance,scaler,False)
-    smoke=smoke_forward(model,make_loader(train_ds,False,CFG.smoke_batch_size),device)
-    model.zero_grad(set_to_none=True)
-    optimizer,fused=make_optimizer(model,device)
+    smoke=smoke_forward(base_model,make_loader(train_ds,False,CFG.smoke_batch_size),device)
+    base_model.zero_grad(set_to_none=True)
+    optimizer,fused=make_optimizer(base_model,device)
+    if CFG.compile_mode != "off":
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("目前PyTorch沒有torch.compile，請設DL_TCN_COMPILE_MODE=off")
+        model=torch.compile(
+            base_model,mode=CFG.compile_mode,fullgraph=False,dynamic=False,
+        )
     amp_dtype=amp_dtype_for(device); grad_scaler=make_grad_scaler(amp_dtype==torch.float16)
     station_weights=make_station_sample_weights(train_ds,len(static),device)
 
@@ -151,7 +158,7 @@ def run_fold(
         resume=torch.load(resume_path,map_location=device,weights_only=False)
         if not np.array_equal(np.asarray(resume["train_indices"]),train_idx) or not np.array_equal(np.asarray(resume["validation_indices"]),val_idx):
             raise RuntimeError(f"fold {fold_id} resume split不一致")
-        model.load_state_dict(resume["model_state_dict"])
+        base_model.load_state_dict(resume["model_state_dict"])
         optimizer.load_state_dict(resume["optimizer_state_dict"])
         grad_scaler.load_state_dict(resume["grad_scaler_state_dict"])
         restore_rng(resume["rng_state"])
@@ -203,7 +210,7 @@ def run_fold(
                 y_pred=predictions["y_pred"].to_numpy("float32"),
             )
         checkpoint={
-            "fold":fold_id,"epoch":epoch,"model_state_dict":cpu_state_dict(model),
+            "fold":fold_id,"epoch":epoch,"model_state_dict":cpu_state_dict(base_model),
             "validation_metrics":metrics,"train_indices":train_idx,"validation_indices":val_idx,
             "outer_index_excluded":outer,"static_columns":static_cols,"scaler":scaler_payload(scaler),
             "config":serializable_config(),"torch_version":torch.__version__,
@@ -223,12 +230,12 @@ def run_fold(
         **split,"epochs_completed":CFG.max_epochs,"runtime_seconds":time.perf_counter()-fold_started,
         "snapshot_directory":str(epoch_dir),"prediction_directory":str(prediction_dir),
         "epoch_predictions_saved":save_epoch_predictions(),
-        "fused_adamw":fused,"device":str(device),
+        "fused_adamw":fused,"device":str(device),"compile_mode":CFG.compile_mode,
     }
     complete_path.write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
     if resume_path.exists():
         resume_path.unlink()
-    del model,optimizer,grad_scaler,feature_builder,train_loader,val_loader,train_ds,val_ds
+    del model,base_model,optimizer,grad_scaler,feature_builder,train_loader,val_loader,train_ds,val_ds
     gc.collect()
     if device.type=="cuda": torch.cuda.empty_cache()
     return summary
