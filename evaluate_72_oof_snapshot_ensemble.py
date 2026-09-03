@@ -151,27 +151,60 @@ def predict_ridge_residual(model: dict, features: np.ndarray) -> np.ndarray:
 def nested_station_ridge(
     base: pd.DataFrame,
     matrix: np.ndarray,
-    prior: np.ndarray,
-) -> tuple[dict, list[dict]]:
-    features = meta_features(base, matrix, prior)
+    candidates: list[dict],
+    final_prior: np.ndarray,
+) -> tuple[dict, list[dict], float, list[dict]]:
     truth = base.y_true.to_numpy(float)
-    prior_prediction = matrix @ prior
-    residual = truth - prior_prediction
     station = base.station_index.to_numpy(int)
     stations = np.unique(station)
-    scores = []
-    for alpha in (0.01, 0.1, 1.0, 10.0, 100.0, 1000.0):
-        held_rmse = []
-        for held in stations:
-            train = station != held
-            test = ~train
+    alphas = (0.01, 0.1, 1.0, 10.0, 100.0, 1000.0)
+    ridge_rmse = {alpha: [] for alpha in alphas}
+    base_rmse = []
+    fold_audit = []
+
+    # Fair paired comparison: for each held station, the base candidate is
+    # selected using only the other 11 stations. Both base and ridge are then
+    # evaluated on exactly the same unseen station.
+    for held in stations:
+        train = station != held
+        test = ~train
+        train_stations = np.unique(station[train])
+        candidate_scores = []
+        for candidate in candidates:
+            prediction = matrix @ candidate["weight"]
+            rmse = [
+                float(np.sqrt(np.mean((truth[(station == s)] - prediction[(station == s)]) ** 2)))
+                for s in train_stations
+            ]
+            candidate_scores.append(float(np.mean(rmse)))
+        chosen_index = int(np.argmin(candidate_scores))
+        chosen = candidates[chosen_index]
+        prior = chosen["weight"]
+        prior_prediction = matrix @ prior
+        features = meta_features(base, matrix, prior)
+        residual = truth - prior_prediction
+        held_base_rmse = float(np.sqrt(np.mean((truth[test] - prior_prediction[test]) ** 2)))
+        base_rmse.append(held_base_rmse)
+        fold_audit.append({
+            "held_station": int(held),
+            "base_family_selected_on_other_11": chosen["family"],
+            "base_parameter": chosen["parameter"],
+            "held_base_rmse": held_base_rmse,
+        })
+        for alpha in alphas:
             model = fit_ridge_residual(features[train], residual[train], station[train], alpha)
             prediction = prior_prediction[test] + predict_ridge_residual(model, features[test])
-            held_rmse.append(float(np.sqrt(np.mean((truth[test] - prediction) ** 2))))
-        scores.append({"alpha": alpha, "station_loso_macro_rmse": float(np.mean(held_rmse))})
+            ridge_rmse[alpha].append(float(np.sqrt(np.mean((truth[test] - prediction) ** 2))))
+    scores = [
+        {"alpha": alpha, "station_loso_macro_rmse": float(np.mean(ridge_rmse[alpha]))}
+        for alpha in alphas
+    ]
     selected = min(scores, key=lambda row: row["station_loso_macro_rmse"])
+    features = meta_features(base, matrix, final_prior)
+    prior_prediction = matrix @ final_prior
+    residual = truth - prior_prediction
     final_model = fit_ridge_residual(features, residual, station, selected["alpha"])
-    return final_model, scores
+    return final_model, scores, float(np.mean(base_rmse)), fold_audit
 
 
 def build_context(root: Path):
@@ -267,12 +300,12 @@ def main() -> None:
         scored.append({**candidate, "held12_macro_rmse": float(np.mean(held_rmse))})
     selected = min(scored, key=lambda row: row["held12_macro_rmse"])
     weights = selected["weight"]
-    ridge_model, ridge_scores = nested_station_ridge(
-        validation_base, validation_matrix, weights
+    ridge_model, ridge_scores, base_loso_rmse, fold_audit = nested_station_ridge(
+        validation_base, validation_matrix, candidates, weights
     )
     ridge_selected = min(ridge_scores, key=lambda row: row["station_loso_macro_rmse"])
     deploy_stacker = (
-        ridge_selected["station_loso_macro_rmse"] < selected["held12_macro_rmse"]
+        ridge_selected["station_loso_macro_rmse"] < base_loso_rmse
     )
     lock = {
         "protocol": "60 stations from metric folds 1..5 create weights; fold_00 12 stations select candidate; lock before Taoyuan truth",
@@ -297,8 +330,10 @@ def main() -> None:
             "candidate_scores": ridge_scores,
             "selected_alpha": ridge_selected["alpha"],
             "nested_macro_rmse": ridge_selected["station_loso_macro_rmse"],
+            "paired_base_station_loso_macro_rmse": base_loso_rmse,
             "accepted_before_taoyuan_truth": deploy_stacker,
-            "acceptance_rule": "station-LOSO RMSE must beat the locked base ensemble score",
+            "acceptance_rule": "paired station-LOSO ridge RMSE must beat paired station-LOSO base RMSE",
+            "fold_audit": fold_audit,
         },
     }
     print("\nLOCKED 60+12 ENSEMBLE BEFORE TAOYUAN TRUTH")
