@@ -20,7 +20,7 @@ DEFAULT_OUTPUT_ROOT = Path(os.environ.get(
 class Config:
     data_root: Path = DEFAULT_DATA_ROOT
     aq_data_dir: Path = DEFAULT_DATA_ROOT / "AQX_P_15_Resource"
-    target_site: str = "桃園"
+    target_site: str = os.environ.get("DL_TCN_TARGET_SITE", "桃園")
     script_dir: Path = SCRIPT_DIR
     resource_dir: Path = DEFAULT_DATA_ROOT / "resources"
     static_path: Path = resource_dir / "station_static_features_49.csv"

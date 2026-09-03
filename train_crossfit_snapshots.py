@@ -80,6 +80,25 @@ def restore_rng(payload: dict) -> None:
         torch.cuda.set_rng_state_all(payload["cuda"])
 
 
+def atomic_torch_save(payload: dict, path: Path) -> None:
+    """Do not leave a valid-looking half checkpoint after a Drive disconnect."""
+    temporary=path.with_suffix(path.suffix+".tmp")
+    torch.save(payload,temporary)
+    os.replace(temporary,path)
+
+
+def atomic_prediction_save(path: Path, predictions: pd.DataFrame) -> None:
+    temporary=path.with_suffix(".tmp.npz")
+    np.savez_compressed(
+        temporary,
+        station_index=predictions["station_index"].to_numpy("int16"),
+        timestamp_ns=pd.to_datetime(predictions["timestamp"]).astype("int64").to_numpy(),
+        y_true=predictions["y_true"].to_numpy("float32"),
+        y_pred=predictions["y_pred"].to_numpy("float32"),
+    )
+    os.replace(temporary,path)
+
+
 def run_fold(
     fold_id:int,train_idx:np.ndarray,val_idx:np.ndarray,outer:int,
     static:pd.DataFrame,clusters:np.ndarray,static_cols:list[str],cube,timestamps,distance,
@@ -202,21 +221,15 @@ def run_fold(
             station_metric_path,index=False,encoding="utf-8-sig"
         )
         if save_epoch_predictions():
-            np.savez_compressed(
-                prediction_dir/f"epoch_{epoch:03d}.npz",
-                station_index=predictions["station_index"].to_numpy("int16"),
-                timestamp_ns=pd.to_datetime(predictions["timestamp"]).astype("int64").to_numpy(),
-                y_true=predictions["y_true"].to_numpy("float32"),
-                y_pred=predictions["y_pred"].to_numpy("float32"),
-            )
+            atomic_prediction_save(prediction_dir/f"epoch_{epoch:03d}.npz",predictions)
         checkpoint={
             "fold":fold_id,"epoch":epoch,"model_state_dict":cpu_state_dict(base_model),
             "validation_metrics":metrics,"train_indices":train_idx,"validation_indices":val_idx,
             "outer_index_excluded":outer,"static_columns":static_cols,"scaler":scaler_payload(scaler),
             "config":serializable_config(),"torch_version":torch.__version__,
         }
-        torch.save(checkpoint,epoch_dir/f"epoch_{epoch:03d}.pt")
-        torch.save({
+        atomic_torch_save(checkpoint,epoch_dir/f"epoch_{epoch:03d}.pt")
+        atomic_torch_save({
             **checkpoint,"optimizer_state_dict":optimizer.state_dict(),
             "grad_scaler_state_dict":grad_scaler.state_dict(),"rng_state":rng_payload(),"history":history,
         },resume_path)

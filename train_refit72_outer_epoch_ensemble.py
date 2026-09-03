@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import time
 from pathlib import Path
 
@@ -28,6 +29,7 @@ from sanity_check import audit_dataset, smoke_forward
 from train_formal import (
     DeviceFeatureBuilder,
     amp_dtype_for,
+    cpu_state_dict,
     make_grad_scaler,
     make_index_loader,
     make_loader,
@@ -40,6 +42,94 @@ from train_formal import (
     train_epoch,
     validate_epoch,
 )
+
+
+def safe_divide(numerator: int, denominator: int) -> float:
+    return float(numerator / denominator) if denominator else float('nan')
+
+
+def event_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    threshold = float(os.environ.get('DL_TCN_EVENT_THRESHOLD', '35.0'))
+    absolute_error_threshold = float(os.environ.get('DL_TCN_ABS_ERROR_THRESHOLD', '20.0'))
+    observed = y_true >= threshold
+    predicted = y_pred >= threshold
+    tp = int(np.sum(observed & predicted))
+    fp = int(np.sum(~observed & predicted))
+    fn = int(np.sum(observed & ~predicted))
+    tn = int(np.sum(~observed & ~predicted))
+    precision = safe_divide(tp, tp + fp)
+    recall = safe_divide(tp, tp + fn)
+    return {
+        'event_threshold': threshold,
+        'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
+        'precision': precision,
+        'recall': recall,
+        'f1': safe_divide(2 * precision * recall, precision + recall)
+        if np.isfinite(precision) and np.isfinite(recall) else float('nan'),
+        'specificity': safe_divide(tn, tn + fp),
+        'accuracy': safe_divide(tp + tn, len(y_true)),
+        'absolute_error_threshold': absolute_error_threshold,
+        'false_high_count': int(np.sum((y_pred - y_true) >= absolute_error_threshold)),
+        'false_low_count': int(np.sum((y_true - y_pred) >= absolute_error_threshold)),
+        'false_high_rate': float(np.mean((y_pred - y_true) >= absolute_error_threshold)),
+        'false_low_rate': float(np.mean((y_true - y_pred) >= absolute_error_threshold)),
+    }
+
+
+def rng_payload() -> dict:
+    result = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        result['cuda'] = torch.cuda.get_rng_state_all()
+    return result
+
+
+def restore_rng(payload: dict) -> None:
+    random.setstate(payload['python'])
+    np.random.set_state(payload['numpy'])
+    torch.set_rng_state(payload['torch'])
+    if torch.cuda.is_available() and 'cuda' in payload:
+        torch.cuda.set_rng_state_all(payload['cuda'])
+
+
+def atomic_torch_save(payload: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def write_final_outputs(
+    output_root: Path,
+    result: dict,
+    timestamp_ns: np.ndarray,
+    truth: np.ndarray,
+    ensemble_prediction: np.ndarray,
+    oracle_prediction: np.ndarray,
+) -> list[str]:
+    siteid = str(result['siteid'])
+    summary_dir = output_root / 'station_summaries'
+    prediction_dir = output_root / 'station_predictions'
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    prediction_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / f'site_{siteid}.json'
+    prediction_path = prediction_dir / f'site_{siteid}.npz'
+    summary_tmp = summary_path.with_suffix('.json.tmp')
+    summary_tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+    os.replace(summary_tmp, summary_path)
+    prediction_tmp = prediction_path.with_suffix('.tmp.npz')
+    np.savez_compressed(
+        prediction_tmp,
+        timestamp_ns=timestamp_ns.astype('int64'),
+        y_true=truth.astype('float32'),
+        ensemble_prediction=ensemble_prediction.astype('float32'),
+        oracle_prediction=oracle_prediction.astype('float32'),
+    )
+    os.replace(prediction_tmp, prediction_path)
+    return [str(summary_path), str(prediction_path)]
 
 
 def main() -> None:
@@ -134,6 +224,9 @@ def main() -> None:
     grad_scaler = make_grad_scaler(amp_dtype == torch.float16)
     station_weights = make_station_sample_weights(train_ds, len(static), device)
 
+    resume_raw = os.environ.get('DL_TCN_REFIT_RESUME_PATH', '').strip()
+    resume_path = Path(resume_raw) if resume_raw else None
+
     print(json.dumps({
         'runtime_profile': runtime,
         'train_samples': len(train_ds),
@@ -148,11 +241,29 @@ def main() -> None:
     }, ensure_ascii=False, indent=2), flush=True)
 
     outer_base = None
-    outer_columns = []
-    history = []
-    started = time.perf_counter()
+    outer_columns: list[np.ndarray] = []
+    history: list[dict] = []
+    start_epoch = 1
     peak_vram = 0.0
-    for epoch in range(1, 16):
+    if resume_path is not None and resume_path.is_file():
+        resume = torch.load(resume_path, map_location=device, weights_only=False)
+        if int(resume['outer']) != outer or not np.array_equal(resume['known'], known):
+            raise RuntimeError('72-refit resume target/protocol不一致')
+        base_model.load_state_dict(resume['model_state_dict'])
+        optimizer.load_state_dict(resume['optimizer_state_dict'])
+        grad_scaler.load_state_dict(resume['grad_scaler_state_dict'])
+        restore_rng(resume['rng_state'])
+        start_epoch = int(resume['epoch']) + 1
+        history = list(resume['history'])
+        outer_columns = [np.asarray(x, dtype=float) for x in resume['outer_columns']]
+        peak_vram = float(resume.get('peak_vram_mb', 0.0))
+        outer_base = pd.DataFrame({
+            'station_index': np.asarray(resume['outer_station_index'], dtype=int),
+            'timestamp': pd.to_datetime(np.asarray(resume['outer_timestamp_ns'], dtype='int64')),
+            'y_true': np.asarray(resume['outer_truth'], dtype=float),
+        })
+        print(f'72-refit resume from epoch {start_epoch}', flush=True)
+    for epoch in range(start_epoch, 16):
         epoch_started = time.perf_counter()
         if device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats(device)
@@ -189,10 +300,37 @@ def main() -> None:
         }
         history.append(row)
         print(json.dumps(row, ensure_ascii=False), flush=True)
+        if resume_path is not None:
+            atomic_torch_save({
+                'outer': outer,
+                'known': known,
+                'epoch': epoch,
+                'model_state_dict': cpu_state_dict(base_model),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'grad_scaler_state_dict': grad_scaler.state_dict(),
+                'rng_state': rng_payload(),
+                'history': history,
+                'outer_columns': outer_columns,
+                'outer_station_index': outer_base.station_index.to_numpy('int16'),
+                'outer_timestamp_ns': pd.to_datetime(outer_base.timestamp).astype('int64').to_numpy(),
+                'outer_truth': outer_base.y_true.to_numpy('float32'),
+                'peak_vram_mb': peak_vram,
+            }, resume_path)
 
     assert outer_base is not None
     outer_matrix = np.stack(outer_columns, axis=1)
     deployed = outer_matrix @ epoch_weights
+    truth = outer_base.y_true.to_numpy(float)
+    epoch_curve = []
+    for epoch, prediction in enumerate(outer_columns, start=1):
+        epoch_curve.append({
+            'epoch': epoch,
+            **regression_metrics(truth, prediction),
+        })
+    oracle_epoch = int(min(epoch_curve, key=lambda row: row['rmse'])['epoch'])
+    oracle_prediction = outer_matrix[:, oracle_epoch - 1]
+    selected_regression = regression_metrics(truth, deployed)
+    oracle_regression = regression_metrics(truth, oracle_prediction)
     result = {
         'target_station_index': int(outer),
         'siteid': str(static.loc[outer, 'siteid']),
@@ -202,13 +340,44 @@ def main() -> None:
         'training_donors_per_sample': 71,
         'outer_donors': 72,
         'epochs': 15,
-        'metrics': regression_metrics(
-            outer_base.y_true.to_numpy(float), deployed
-        ),
-        'training_runtime_seconds': time.perf_counter() - started,
+        'epoch_selection': {
+            'method': method,
+            'weights': [float(x) for x in epoch_weights],
+        },
+        'truth_timestamps': int(len(truth)),
+        'ensemble': {
+            'regression': selected_regression,
+            'events': event_metrics(truth, deployed),
+        },
+        'oracle': {
+            'uses_outer_truth': True,
+            'epoch': oracle_epoch,
+            'regression': oracle_regression,
+            'events': event_metrics(truth, oracle_prediction),
+        },
+        'epoch_curve': epoch_curve,
+        'training_runtime_seconds': float(sum(row['runtime_seconds'] for row in history)),
         'peak_vram_mb': peak_vram,
         'files_written': 0,
     }
+    output_raw = os.environ.get('DL_TCN_REFIT_OUTPUT_ROOT', '').strip()
+    if output_raw:
+        paths = write_final_outputs(
+            Path(output_raw), result,
+            pd.to_datetime(outer_base.timestamp).astype('int64').to_numpy(),
+            truth, deployed, oracle_prediction,
+        )
+        result['files_written'] = len(paths)
+        result['output_files'] = paths
+        # Rewrite the summary once so it also records its final output paths.
+        summary_path = Path(paths[0])
+        summary_tmp = summary_path.with_suffix('.json.tmp')
+        summary_tmp.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8'
+        )
+        os.replace(summary_tmp, summary_path)
+    if resume_path is not None and resume_path.exists():
+        resume_path.unlink()
     print('\nREFIT-72 OUTER EPOCH-ENSEMBLE RESULT')
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
 
