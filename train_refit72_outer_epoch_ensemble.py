@@ -109,6 +109,7 @@ def write_final_outputs(
     truth: np.ndarray,
     ensemble_prediction: np.ndarray,
     oracle_prediction: np.ndarray,
+    epoch_predictions: np.ndarray,
 ) -> list[str]:
     siteid = str(result['siteid'])
     summary_dir = output_root / 'station_summaries'
@@ -127,6 +128,7 @@ def write_final_outputs(
         y_true=truth.astype('float32'),
         ensemble_prediction=ensemble_prediction.astype('float32'),
         oracle_prediction=oracle_prediction.astype('float32'),
+        epoch_predictions=epoch_predictions.astype('float32'),
     )
     os.replace(prediction_tmp, prediction_path)
     return [str(summary_path), str(prediction_path)]
@@ -142,19 +144,40 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision('high')
 
-    crossfit_root = Path(os.environ.get(
-        'DL_TCN_CROSSFIT_ROOT',
-        str(CFG.formal_output_root / 'crossfit_target_conditioned_snapshots'),
-    ))
-    oof_base, oof_matrix = load_all_oof(crossfit_root)
-    method, method_rows = select_method_by_sixfold_oof(oof_base, oof_matrix)
-    oof_stations = np.unique(oof_base.station_index.to_numpy(int))
-    epoch_weights = fit_epoch_weights(
-        oof_base, oof_matrix, oof_stations,
-        method['family'], method['parameter'],
-    )
+    locked_raw = os.environ.get('DL_TCN_LOCKED_ENSEMBLE_PATH', '').strip()
+    locked = None
+    if locked_raw:
+        locked_path = Path(locked_raw)
+        locked = json.loads(locked_path.read_text(encoding='utf-8'))
+        epoch_weights = np.asarray(locked['epoch_weights'], dtype=float)
+        method = dict(locked['selected_method'])
+        method_rows = list(locked.get('candidate_scores', []))
+        if len(epoch_weights) != 15 or np.any(epoch_weights < 0):
+            raise RuntimeError('locked ensemble必須是15個非負權重')
+        if not np.isclose(epoch_weights.sum(), 1.0, atol=1e-6):
+            raise RuntimeError('locked ensemble權重總和不是1')
+        lock_protocol = str(locked['protocol'])
+        lock_metadata = {
+            key: locked[key]
+            for key in ('outer_group', 'outer_siteids', 'selector_known_stations')
+            if key in locked
+        }
+    else:
+        crossfit_root = Path(os.environ.get(
+            'DL_TCN_CROSSFIT_ROOT',
+            str(CFG.formal_output_root / 'crossfit_target_conditioned_snapshots'),
+        ))
+        oof_base, oof_matrix = load_all_oof(crossfit_root)
+        method, method_rows = select_method_by_sixfold_oof(oof_base, oof_matrix)
+        oof_stations = np.unique(oof_base.station_index.to_numpy(int))
+        epoch_weights = fit_epoch_weights(
+            oof_base, oof_matrix, oof_stations,
+            method['family'], method['parameter'],
+        )
+        lock_protocol = '72-station OOF locks epoch ensemble before 72-station refit and outer truth'
+        lock_metadata = {}
     lock = {
-        'protocol': '72-station OOF locks epoch ensemble before 72-station refit and outer truth',
+        'protocol': lock_protocol,
         'selection_used_outer_truth': False,
         'selected_method': method,
         'candidate_scores': sorted(method_rows, key=lambda row: row['sixfold_oof_macro_rmse']),
@@ -168,6 +191,13 @@ def main() -> None:
 
     static, _, static_cols = load_static()
     outer = resolve_target(static, CFG.target_site)
+    if locked is not None:
+        allowed = {str(x) for x in locked.get('outer_siteids', [])}
+        outer_siteid = str(static.loc[outer, 'siteid'])
+        if allowed and outer_siteid not in allowed:
+            raise RuntimeError(
+                f'locked ensemble不屬於outer site {outer_siteid}; allowed={sorted(allowed)}'
+            )
     known = np.asarray([idx for idx in range(len(static)) if idx != outer], dtype=int)
     if len(known) != 72:
         raise RuntimeError(f'outer排除後不是72站: {len(known)}')
@@ -341,6 +371,8 @@ def main() -> None:
         'outer_donors': 72,
         'epochs': 15,
         'epoch_selection': {
+            'protocol': lock_protocol,
+            **lock_metadata,
             'method': method,
             'weights': [float(x) for x in epoch_weights],
         },
@@ -365,7 +397,7 @@ def main() -> None:
         paths = write_final_outputs(
             Path(output_raw), result,
             pd.to_datetime(outer_base.timestamp).astype('int64').to_numpy(),
-            truth, deployed, oracle_prediction,
+            truth, deployed, oracle_prediction, outer_matrix,
         )
         result['files_written'] = len(paths)
         result['output_files'] = paths

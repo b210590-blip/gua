@@ -114,7 +114,7 @@ def atomic_csv_save(frame: pd.DataFrame, path: Path) -> None:
 def run_fold(
     fold_id:int,train_idx:np.ndarray,val_idx:np.ndarray,outer:int,
     static:pd.DataFrame,clusters:np.ndarray,static_cols:list[str],cube,timestamps,distance,
-    root:Path,device:torch.device,
+    root:Path,device:torch.device,excluded_indices:np.ndarray|None=None,
 ) -> dict:
     # A fold must be reproducible whether it is run alone or after another
     # fold. Resume later restores the exact post-epoch RNG state.
@@ -130,8 +130,13 @@ def run_fold(
         print(f"fold {fold_id}: COMPLETE exists, skip",flush=True)
         return json.loads(complete_path.read_text(encoding="utf-8"))
 
-    if len(train_idx)!=60 or len(val_idx)!=12 or outer in train_idx or outer in val_idx:
-        raise RuntimeError(f"fold {fold_id} protocol不是60/12且outer排除")
+    excluded=np.asarray([outer] if excluded_indices is None else excluded_indices,dtype=int)
+    if np.intersect1d(train_idx,val_idx).size:
+        raise RuntimeError(f"fold {fold_id} training/validation重疊")
+    if np.intersect1d(np.concatenate([train_idx,val_idx]),excluded).size:
+        raise RuntimeError(f"fold {fold_id} 混入excluded station")
+    if set(np.concatenate([train_idx,val_idx,excluded]).tolist())!=set(range(len(static))):
+        raise RuntimeError(f"fold {fold_id} split未完整覆蓋73站")
     scaler=fit_train_only_scaler(cube,timestamps,static,static_cols,train_idx)
     static_scaled=standardize_static(static,static_cols,scaler)
     train_ds=ColdStartStationDataset(
@@ -142,10 +147,12 @@ def run_fold(
         val_idx,train_idx,CFG.train_start,CFG.train_end,cube,timestamps,
         static,static_scaled,distance,scaler,
     )
-    if audit_dataset(train_ds,max_samples=32)["sampled_donor_counts"]!=[59]:
-        raise RuntimeError(f"fold {fold_id} training donors不是59")
-    if audit_dataset(val_ds,max_samples=32)["sampled_donor_counts"]!=[60]:
-        raise RuntimeError(f"fold {fold_id} validation donors不是60")
+    expected_training_donors=len(train_idx)-1
+    expected_validation_donors=len(train_idx)
+    if audit_dataset(train_ds,max_samples=32)["sampled_donor_counts"]!=[expected_training_donors]:
+        raise RuntimeError(f"fold {fold_id} training donors不是{expected_training_donors}")
+    if audit_dataset(val_ds,max_samples=32)["sampled_donor_counts"]!=[expected_validation_donors]:
+        raise RuntimeError(f"fold {fold_id} validation donors不是{expected_validation_donors}")
 
     base_model=TCNTargetCrossAttention(static_dim=len(static_cols)).to(device)
     model=base_model
@@ -153,7 +160,7 @@ def run_fold(
     if device.type=="cuda":
         max_time_index=int(max(train_ds.row_times.max(),val_ds.row_times.max()))
         feature_builder=DeviceFeatureBuilder(
-            train_idx,cube,max_time_index,timestamps,static,static_scaled,distance,scaler,outer,device,
+            train_idx,cube,max_time_index,timestamps,static,static_scaled,distance,scaler,excluded,device,
         )
         train_loader=make_index_loader(train_ds,True); val_loader=make_index_loader(val_ds,False)
     else:
@@ -173,12 +180,15 @@ def run_fold(
 
     split={
         "fold":fold_id,"outer_index":int(outer),"outer_siteid":str(static.loc[outer,"siteid"]),
+        "excluded_indices":excluded.tolist(),
+        "excluded_siteids":static.loc[excluded,"siteid"].astype(str).tolist(),
         "train_indices":train_idx.tolist(),"validation_indices":val_idx.tolist(),
         "train_siteids":static.loc[train_idx,"siteid"].astype(str).tolist(),
         "validation_siteids":static.loc[val_idx,"siteid"].astype(str).tolist(),
         "train_clusters":sorted(np.unique(clusters[train_idx]).astype(int).tolist()),
         "validation_clusters":sorted(np.unique(clusters[val_idx]).astype(int).tolist()),
-        "training_donors":59,"validation_donors":60,
+        "training_donors":expected_training_donors,
+        "validation_donors":expected_validation_donors,
     }
     atomic_text_save(fold_dir/"split.json",json.dumps(split,ensure_ascii=False,indent=2))
     atomic_text_save(fold_dir/"sanity.json",json.dumps({"split":split,"model":smoke},ensure_ascii=False,indent=2))
@@ -237,7 +247,8 @@ def run_fold(
         checkpoint={
             "fold":fold_id,"epoch":epoch,"model_state_dict":cpu_state_dict(base_model),
             "validation_metrics":metrics,"train_indices":train_idx,"validation_indices":val_idx,
-            "outer_index_excluded":outer,"static_columns":static_cols,"scaler":scaler_payload(scaler),
+            "outer_index_excluded":outer,"outer_indices_excluded":excluded,
+            "static_columns":static_cols,"scaler":scaler_payload(scaler),
             "config":serializable_config(),"torch_version":torch.__version__,
         }
         atomic_torch_save(checkpoint,epoch_dir/f"epoch_{epoch:03d}.pt")

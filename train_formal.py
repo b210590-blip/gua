@@ -97,7 +97,10 @@ class DeviceFeatureBuilder:
         # only after model selection is locked.
         pm25_index=CFG.aq_cube_items.index("PM2.5")
         labels_np=np.array(cube_np[:,:,pm25_index],dtype="float32",copy=True)
-        cube_np[:,outer_index,:]=np.nan
+        # Accept either one ordinary LOSO target or a complete held-out group.
+        # Every excluded station is hidden before GPU feature tables are built.
+        hidden=np.atleast_1d(np.asarray(outer_index,dtype=int))
+        cube_np[:,hidden,:]=np.nan
         cube_tensor=torch.from_numpy(cube_np).to(device)
         del cube_np
         donor_pool=np.asarray(donor_pool,dtype="int64")

@@ -192,10 +192,13 @@ def fit_fold_calibration(
 def select_method_by_sixfold_oof(
     base: pd.DataFrame, matrix: np.ndarray
 ) -> tuple[dict, list[dict]]:
+    fold_values = sorted(base.fold.unique().astype(int).tolist())
+    if len(fold_values) < 2:
+        raise ValueError('ensemble method selection至少需要2個OOF folds')
     rows = []
     for family, parameter in METHOD_SPECS:
         held_scores = []
-        for fold in range(6):
+        for fold in fold_values:
             train_stations = np.unique(base.loc[base.fold != fold, 'station_index'].to_numpy(int))
             held_stations = np.unique(base.loc[base.fold == fold, 'station_index'].to_numpy(int))
             weight = fit_epoch_weights(base, matrix, train_stations, family, parameter)
